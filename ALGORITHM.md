@@ -117,9 +117,11 @@ FRONTIER_VERIFY=1               # 每层完整结构检查
 `max(max_vertex_weight, ceil(total_vertex_weight / (SCLP_BETA * parts)))`，默认
 `SCLP_BETA=64`。每轮最多将当前非空 cluster 中足以接近原层 `0.5*n` 的一部分
 设为 mover，且 mover 比例不超过 50%；达到 `coarse_vertices <= 0.6*n` 后停止
-普通 LP。否则最多 4 轮后，对拥有相同 one-hop favorite 的 singleton 按确定性
-顺序两两配对，每个 two-hop cluster 最多两个点，并用全局 merge budget 只补到
-约 `0.5*n`。该 fallback 仅用于进度，不作为主力 aggressive contraction。
+普通 LP。最多 4 轮后，只有自然收缩比例仍高于 `SCLP_TWO_HOP_THRESHOLD`
+（默认 `0.50`）时，才对拥有相同 one-hop favorite 的 singleton 按确定性顺序
+两两配对；每个 two-hop cluster 最多两个点，并用全局 merge budget 只补到约
+`0.5*n`。设置 `SCLP_TWO_HOP_THRESHOLD=off` 可完全关闭 fallback。该机制仅用于
+进度，不作为主力 aggressive contraction。
 
 cluster ID 随后在 GPU compact；点权累加和加权粗 CSR 继续复用 device-resident
 GPU contraction。可配置项只有：
@@ -127,20 +129,31 @@ GPU contraction。可配置项只有：
 ```bash
 SCLP_BETA=64
 SCLP_ROUNDS=4                 # 允许 2--4
+SCLP_TWO_HOP_THRESHOLD=0.50   # 取值 [0.50,1.00]，或 off
 SCLP_VERIFY=1                 # 每层容量、CSR、权重和投影切边检查
 SCLP_DIAGNOSTICS=1
 ```
 
 每层汇总输出 `fine_vertices/coarse_vertices/contraction_ratio/lp_accepted/`
-`capacity_rejected/singleton/two_hop_merged`，每轮另输出 proposal、接受、拒绝和
-当前 cluster 数、预测 gain 和调试模式下的完整重算实际 gain。seed 用于角色划分
-与 affinity tie-break；相同 seed 仍保证确定性，但不再有 smallest-ID 偏置。
+`capacity_rejected/singleton/two_hop_merged`，以及 `positive_gain_vertices/`
+`role_blocked/role_blocked_gain/singleton_with_favorite/pairable_singletons`。
+点权分布输出 `weight_p50/p90/p99/max`、`weight_max_over_cap` 和容量拒绝比例。
+每轮另输出 proposal、接受、拒绝、当前 cluster 数、预测 gain 和调试模式下的
+完整重算实际 gain。seed 用于角色划分与 affinity tie-break；相同 seed 仍保证
+确定性，但不再有 smallest-ID 偏置。
 
-结构语义修正版在 products 和 LiveJournal 首层均控制到 50% 左右。固定 Jet
-后半段后，products 从旧 SCLP 的 2,218,136 改善到 2,179,926；LiveJournal 从
-4,166,454 大幅改善到 3,544,983。它们仍未稳定胜过对应 Jet 原粗化，因此 SCLP
-仍是隔离实验后端；本轮没有改变 beta/rounds，也没有增加 degree penalty、
-confidence 或 hot/cold。完整数值和产物保存在 sibling `single_gpu_lp_baseline`。
+`ml_gpu_device_core_seconds` 只累计 SCLP aggregate 与 GPU contraction；包含 host
+snapshot 和验证的整个循环另记为 `ml_hierarchy_loop_seconds`，避免把 snapshot
+时间误称为纯 GPU core 时间。
+
+结构语义修正版已消除旧版本的大幅质量退化。进一步消融表明 two-hop 的效果
+有图依赖：阈值 `0.60` 相对 `0.50` 改善 products 且小幅改善 LiveJournal，完全
+关闭则改善 LiveJournal 但明显损害 products；因此没有加入数据集特定规则。
+固定 `threshold=0.60` 后，`beta=256` 的五 seed 对照中，SCLP+Jet 后半段平均仍
+略差于 Jet 原粗化（products 约 `+1.14%`，LiveJournal 约 `+0.36%`，正数表示
+切边更多），尚不构成稳定质量胜出。SCLP 仍是隔离实验后端；没有增加 degree
+penalty、confidence 或 hot/cold。完整数值和产物保存在 sibling
+`single_gpu_lp_baseline`。
 
 ## 可复核实验
 
@@ -176,6 +189,7 @@ METHOD=frontier FRONTIER_CONTRACTION_FACTOR=8 \
   FRONTIER_CAPACITY_SLACK=0.20 FRONTIER_HOT_RATIO=0.50 \
   experiments/run_gpu_lp_jet_compare.sh products
 KS=4 METHOD=sclp SCLP_BETA=64 SCLP_ROUNDS=4 \
+  SCLP_TWO_HOP_THRESHOLD=0.60 \
   experiments/run_gpu_lp_jet_compare.sh products com-LiveJournal
 ```
 

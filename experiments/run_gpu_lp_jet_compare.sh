@@ -26,6 +26,7 @@ FRONTIER_CAPACITY_SLACK="${FRONTIER_CAPACITY_SLACK:-0.20}"
 FRONTIER_HOT_RATIO="${FRONTIER_HOT_RATIO:-0.50}"
 SCLP_BETA="${SCLP_BETA:-64}"
 SCLP_ROUNDS="${SCLP_ROUNDS:-4}"
+SCLP_TWO_HOP_THRESHOLD="${SCLP_TWO_HOP_THRESHOLD:-0.50}"
 
 case "$METHOD" in
     lp|basc|basc_gpu|frontier|sclp) ;;
@@ -56,7 +57,8 @@ for dataset in "${DATASETS[@]}"; do
         frontier_hot_tag="${FRONTIER_HOT_RATIO//./p}"
         method_tag="frontier_r${FRONTIER_CONTRACTION_FACTOR}_s${frontier_slack_tag}_h${frontier_hot_tag}"
     elif [[ "$METHOD" == "sclp" ]]; then
-        method_tag="sclp_b${SCLP_BETA}_r${SCLP_ROUNDS}"
+        sclp_two_hop_tag="${SCLP_TWO_HOP_THRESHOLD//./p}"
+        method_tag="sclp_b${SCLP_BETA}_r${SCLP_ROUNDS}_th${sclp_two_hop_tag}"
     else
         method_tag="lp"
     fi
