@@ -1,0 +1,11 @@
+build/
+build-*/
+__pycache__/
+*.pyc
+*.hierarchy
+*.part
+*.parts
+*.out
+*.log
+*.json
+experiments/results/
