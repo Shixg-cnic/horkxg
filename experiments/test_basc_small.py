@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small independent oracle for the BASC hierarchy exporter.
+"""Small independent oracle for the GPU coarsening hierarchy exporter.
 
 The test creates a symmetric CSR with an isolated component, parallel edges,
 and self-loops, then checks every emitted level without importing the C++
@@ -13,6 +13,7 @@ import random
 import re
 import struct
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -113,8 +114,8 @@ def check(path: Path, capacities: list[int]) -> None:
 def main() -> None:
     binary = Path(os.environ.get("MULTILEVEL_BIN", "build-gh200/multilevel_lp"))
     method = os.environ.get("BASC_TEST_METHOD", "basc")
-    if method not in {"basc", "basc_gpu", "frontier"}:
-        raise SystemExit("BASC_TEST_METHOD must be basc, basc_gpu, or frontier")
+    if method not in {"basc", "basc_gpu", "frontier", "sclp"}:
+        raise SystemExit("BASC_TEST_METHOD must be basc, basc_gpu, frontier, or sclp")
     with tempfile.TemporaryDirectory(prefix="basc-small-") as tmp:
         root = Path(tmp)
         offsets, indices = make_graph()
@@ -123,15 +124,27 @@ def main() -> None:
         for k in (1, 2, 4):
             out = root / f"basc-k{k}.hierarchy"
             log = root / f"basc-k{k}.log"
+            child_env = os.environ.copy()
+            # beta=64 intentionally gives capacity one on this 256-vertex
+            # fixture.  Use a smaller beta to exercise weighted admission and
+            # contraction; production defaults remain unchanged.
+            if method == "sclp":
+                child_env.setdefault("SCLP_BETA", "1")
+            stop_ratio = "1.0" if method == "sclp" else "0.85"
             subprocess.run(
                 [str(binary), str(root / "indptr.bin"), str(root / "indices.bin"),
-                 "4", str(out), "1.10", "0", "0.85", method, str(k)],
+                 "4", str(out), "1.10", "0", stop_ratio, method, str(k)],
                 check=True, stdout=log.open("w"), stderr=subprocess.STDOUT,
+                env=child_env,
             )
             text = log.read_text()
             capacities = [int(x) for x in re.findall(
-                r"ml_gpu_(?:basc(?:_device)?|frontier) .*?cluster_cap=(\d+)", text)]
-            check(out, capacities)
+                r"ml_gpu_(?:basc(?:_device)?|frontier|sclp) .*?cluster_cap=(\d+)", text)]
+            try:
+                check(out, capacities)
+            except Exception:
+                print(text, file=sys.stderr)
+                raise
             assert "projection_cut=ok" in text
     print(f"{method} small hierarchy, capacity, symmetry, coverage, and cut tests passed")
 

@@ -94,6 +94,48 @@ FRONTIER_VERIFY=1               # 每层完整结构检查
 据此宣称质量改善。数值结果保存在 sibling `single_gpu_lp_baseline` 的实验报告和
 产物目录，本代码仓库不存放大型实验输出。
 
+## Size-constrained LP 粗化
+
+`coarsen_method=sclp` 是独立后端，不调用 BASC 或 frontier。每层从
+`cluster[v]=v` 开始，默认最多执行 4 轮：
+
+1. 按顶点度数分为 low/medium/high 三组；low 使用 thread-per-vertex（一个 warp
+   同时处理多个低度点），medium 使用 warp-per-vertex，high 使用 CTA-per-vertex；
+2. 三类 kernel 在 GPU 写出 `(vertex, neighbor_cluster)` 键，sort/reduce 得到精确
+   加权 affinity，不使用 top-K 近似；
+3. 每个顶点选择 affinity 最大的异 cluster，平局选择较小 cluster ID；
+4. proposal 按 `(target, -affinity, vertex)` 稳定排序，按 target 做 segmented
+   prefix sum，仅接受前缀点权不超过目标剩余容量的 proposal；
+5. acceptance 基于同一快照，一次同步提交。atomic 只累加已经确定的整数权重，
+   不参与 admission 决策，因此结果不依赖线程到达顺序。
+
+簇容量为
+`max(max_vertex_weight, ceil(total_vertex_weight / (SCLP_BETA * parts)))`，默认
+`SCLP_BETA=64`。若任一轮达到 `coarse_vertices <= 0.5 * fine_vertices`，立即结束
+该层 LP。否则最多 4 轮后，对仍为 singleton 且拥有相同 one-hop favorite 的点做
+一次确定性、容量受限的 two-hop grouping。该 fallback 仅用于继续收缩，不作为新
+评分机制。
+
+cluster ID 随后在 GPU compact；点权累加和加权粗 CSR 继续复用 device-resident
+GPU contraction。可配置项只有：
+
+```bash
+SCLP_BETA=64
+SCLP_ROUNDS=4                 # 允许 2--4
+SCLP_VERIFY=1                 # 每层容量、CSR、权重和投影切边检查
+SCLP_DIAGNOSTICS=1
+```
+
+每层汇总输出 `fine_vertices/coarse_vertices/contraction_ratio/lp_accepted/`
+`capacity_rejected/singleton/two_hop_merged`，每轮另输出 proposal、接受、拒绝和
+当前 cluster 数。seed 只进入统一实验接口；当前 SCLP tie-break 完全确定，不消费
+随机数。
+
+第一版 k=4 结果表明，products 和 LiveJournal 首层分别收缩到原图的 17.2% 和
+26.1%，但固定 Jet 后半段的质量均未胜过 Jet 原粗化，LiveJournal 退化尤其明显。
+因此 SCLP 目前是隔离实验后端，不替换默认路径，也没有继续增加 degree penalty、
+confidence 或 seed 机制。完整数值和产物保存在 sibling `single_gpu_lp_baseline`。
+
 ## 可复核实验
 
 小图正确性测试：
@@ -111,6 +153,8 @@ GPU_LP_STRICT_VERIFY=1 BASC_TEST_METHOD=basc_gpu \
   python3 experiments/test_basc_small.py
 GPU_LP_STRICT_VERIFY=1 FRONTIER_DIAGNOSTICS=1 BASC_TEST_METHOD=frontier \
   python3 experiments/test_basc_small.py
+GPU_LP_STRICT_VERIFY=1 SCLP_VERIFY=1 BASC_TEST_METHOD=sclp \
+  python3 experiments/test_basc_small.py
 python3 experiments/test_basc_repeatability.py --method basc_gpu \
   --indptr ../dataset/Gpartition_dataset/Sym_CSR/kim2/kim2_sym_indptr.bin \
   --indices ../dataset/Gpartition_dataset/Sym_CSR/kim2/kim2_sym_indices.bin \
@@ -125,6 +169,8 @@ METHOD=basc_gpu BASC_K=2 STOP_RATIO=0.90 MAX_LEVELS=24 \
 METHOD=frontier FRONTIER_CONTRACTION_FACTOR=8 \
   FRONTIER_CAPACITY_SLACK=0.20 FRONTIER_HOT_RATIO=0.50 \
   experiments/run_gpu_lp_jet_compare.sh products
+KS=4 METHOD=sclp SCLP_BETA=64 SCLP_ROUNDS=4 \
+  experiments/run_gpu_lp_jet_compare.sh products com-LiveJournal
 ```
 
 完整结果和大型产物保存在 sibling `single_gpu_lp_baseline` 项目中。

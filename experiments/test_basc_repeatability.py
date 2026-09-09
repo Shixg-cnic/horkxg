@@ -37,7 +37,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--basc-k", type=int, default=2)
     parser.add_argument(
-        "--method", choices=("basc", "basc_gpu", "frontier"), default="basc"
+        "--method", choices=("basc", "basc_gpu", "frontier", "sclp"), default="basc"
     )
     parser.add_argument("--stop-ratio", type=float, default=0.85)
     parser.add_argument("--max-levels", type=int, default=24)
@@ -86,7 +86,7 @@ def main() -> None:
                 "hierarchy": str(hierarchy),
                 "sha256": sha256(hierarchy),
                 "basc_levels": len(re.findall(
-                    r"^ml_gpu_(?:basc(?:_device)?|frontier) level=",
+                    r"^ml_gpu_(?:basc(?:_device)?|frontier|sclp) level=",
                     log_text, re.MULTILINE)),
                 "coarsen_seconds": float(
                     re.findall(r"ml_total_seconds=([0-9.e+-]+)", log_text)[-1]

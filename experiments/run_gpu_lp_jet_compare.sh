@@ -20,13 +20,16 @@ STOP_RATIO="${STOP_RATIO:-0.90}"
 METHOD="${METHOD:-lp}"
 BASC_K="${BASC_K:-2}"
 MAX_LEVELS="${MAX_LEVELS:-24}"
+KS="${KS:-4 8 32}"
 FRONTIER_CONTRACTION_FACTOR="${FRONTIER_CONTRACTION_FACTOR:-8}"
 FRONTIER_CAPACITY_SLACK="${FRONTIER_CAPACITY_SLACK:-0.20}"
 FRONTIER_HOT_RATIO="${FRONTIER_HOT_RATIO:-0.50}"
+SCLP_BETA="${SCLP_BETA:-64}"
+SCLP_ROUNDS="${SCLP_ROUNDS:-4}"
 
 case "$METHOD" in
-    lp|basc|basc_gpu|frontier) ;;
-    *) echo "METHOD must be lp, basc, basc_gpu, or frontier" >&2; exit 2 ;;
+    lp|basc|basc_gpu|frontier|sclp) ;;
+    *) echo "METHOD must be lp, basc, basc_gpu, frontier, or sclp" >&2; exit 2 ;;
 esac
 
 if [[ "$#" -gt 0 ]]; then
@@ -35,6 +38,7 @@ else
     DATASETS=(products com-LiveJournal)
 fi
 
+read -r -a PARTS_LIST <<< "$KS"
 for dataset in "${DATASETS[@]}"; do
     case "$dataset" in
         products|com-LiveJournal) ;;
@@ -51,10 +55,17 @@ for dataset in "${DATASETS[@]}"; do
         frontier_slack_tag="${FRONTIER_CAPACITY_SLACK//./p}"
         frontier_hot_tag="${FRONTIER_HOT_RATIO//./p}"
         method_tag="frontier_r${FRONTIER_CONTRACTION_FACTOR}_s${frontier_slack_tag}_h${frontier_hot_tag}"
+    elif [[ "$METHOD" == "sclp" ]]; then
+        method_tag="sclp_b${SCLP_BETA}_r${SCLP_ROUNDS}"
     else
         method_tag="lp"
     fi
-    for k in 4 8 32; do
+    for k in "${PARTS_LIST[@]}"; do
+        if [[ "$k" != "2" && "$k" != "4" && "$k" != "8" &&
+              "$k" != "16" && "$k" != "32" ]]; then
+            echo "unsupported k in KS: ${k}" >&2
+            exit 2
+        fi
         run_dir="${OUT_ROOT}/${dataset}/k${k}/seed${SEED}/${method_tag}"
         mkdir -p "$run_dir"
         config="${run_dir}/jet_config.txt"
