@@ -7,7 +7,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_ARCHITECTURES 80 CACHE STRING "CUDA architectures")
+# The primary test host is GH200 (SM90). Override this cache entry when using
+# a different GPU, e.g. -DCMAKE_CUDA_ARCHITECTURES=80.
+set(CMAKE_CUDA_ARCHITECTURES 90 CACHE STRING "CUDA architectures")
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 
 add_executable(multilevel_lp
