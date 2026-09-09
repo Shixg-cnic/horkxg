@@ -1538,6 +1538,11 @@ __global__ void sclp_fill_affinity_low_kernel(
     if (i >= count) return;
     const auto v = vertices[i];
     for (auto e = offsets[v]; e < offsets[v + 1]; ++e) {
+        if (neighbors[e] == v) {
+            keys[e] = BASC_INVALID_KEY;
+            values[e] = 0;
+            continue;
+        }
         keys[e] = (static_cast<std::uint64_t>(static_cast<std::uint32_t>(v)) << 32) |
                   static_cast<std::uint32_t>(clusters[neighbors[e]]);
         values[e] = edge_weights[e];
@@ -1555,6 +1560,11 @@ __global__ void sclp_fill_affinity_medium_kernel(
     if (warp >= count) return;
     const auto v = vertices[warp];
     for (auto e = offsets[v] + lane; e < offsets[v + 1]; e += BASC_WARP_SIZE) {
+        if (neighbors[e] == v) {
+            keys[e] = BASC_INVALID_KEY;
+            values[e] = 0;
+            continue;
+        }
         keys[e] = (static_cast<std::uint64_t>(static_cast<std::uint32_t>(v)) << 32) |
                   static_cast<std::uint32_t>(clusters[neighbors[e]]);
         values[e] = edge_weights[e];
@@ -1570,47 +1580,101 @@ __global__ void sclp_fill_affinity_high_kernel(
     if (i >= count) return;
     const auto v = vertices[i];
     for (auto e = offsets[v] + threadIdx.x; e < offsets[v + 1]; e += blockDim.x) {
+        if (neighbors[e] == v) {
+            keys[e] = BASC_INVALID_KEY;
+            values[e] = 0;
+            continue;
+        }
         keys[e] = (static_cast<std::uint64_t>(static_cast<std::uint32_t>(v)) << 32) |
                   static_cast<std::uint32_t>(clusters[neighbors[e]]);
         values[e] = edge_weights[e];
     }
 }
 
-__global__ void sclp_best_affinity_kernel(
+__device__ __forceinline__ bool sclp_cluster_is_mover(
+    std::int32_t cluster, std::uint32_t role_salt,
+    std::uint32_t mover_threshold) {
+    return mix32(static_cast<std::uint32_t>(cluster) ^ role_salt) < mover_threshold;
+}
+
+__global__ void sclp_affinity_baseline_kernel(
     std::int64_t count, const std::uint64_t* keys,
     const std::uint64_t* connections, const std::int32_t* clusters,
+    std::uint32_t role_salt, std::uint32_t mover_threshold,
+    bool filter_roles, unsigned long long* current_affinity,
     unsigned long long* best_affinity) {
     const auto i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) return;
     const auto v = static_cast<std::uint32_t>(keys[i] >> 32);
     const auto target = static_cast<std::int32_t>(keys[i]);
-    if (target == clusters[v]) return;
+    const auto source = clusters[v];
+    if (target == source) {
+        current_affinity[v] = static_cast<unsigned long long>(connections[i]);
+        return;
+    }
+    if (filter_roles && sclp_cluster_is_mover(
+            target, role_salt, mover_threshold)) return;
     atomicMax(best_affinity + v,
               static_cast<unsigned long long>(connections[i]));
 }
 
-__global__ void sclp_best_target_kernel(
+__global__ void sclp_best_tie_kernel(
     std::int64_t count, const std::uint64_t* keys,
     const std::uint64_t* connections, const std::int32_t* clusters,
-    const unsigned long long* best_affinity, std::int32_t* proposals) {
+    const unsigned long long* best_affinity, std::uint32_t tie_salt,
+    std::uint32_t role_salt, std::uint32_t mover_threshold,
+    bool filter_roles, unsigned long long* best_ties) {
     const auto i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) return;
     const auto v = static_cast<std::uint32_t>(keys[i] >> 32);
     const auto target = static_cast<std::int32_t>(keys[i]);
-    if (target == clusters[v] || connections[i] != best_affinity[v]) return;
-    atomicMin(proposals + v, target);
+    const auto source = clusters[v];
+    if (target == source || connections[i] != best_affinity[v]) return;
+    if (filter_roles && sclp_cluster_is_mover(
+            target, role_salt, mover_threshold)) return;
+    const auto hash = mix32(v ^ mix32(static_cast<std::uint32_t>(target)) ^ tie_salt);
+    const auto key = (static_cast<unsigned long long>(hash) << 32) |
+                     (0xffffffffULL - static_cast<std::uint32_t>(target));
+    atomicMax(best_ties + v, key);
+}
+
+__global__ void sclp_decode_gain_kernel(
+    std::int64_t n, const std::int32_t* clusters,
+    const unsigned long long* current_affinity,
+    const unsigned long long* best_affinity,
+    const unsigned long long* best_ties,
+    std::uint32_t role_salt, std::uint32_t mover_threshold,
+    bool filter_roles, std::int32_t* proposals,
+    unsigned long long* gains, std::uint32_t* proposal_ties) {
+    const auto v = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (v >= n) return;
+    proposals[v] = SCLP_INVALID;
+    gains[v] = 0;
+    proposal_ties[v] = 0;
+    const auto source = clusters[v];
+    if (filter_roles && !sclp_cluster_is_mover(
+            source, role_salt, mover_threshold)) return;
+    if (best_affinity[v] == 0 || best_affinity[v] <= current_affinity[v]) return;
+    const auto target = static_cast<std::int32_t>(
+        0xffffffffULL - (best_ties[v] & 0xffffffffULL));
+    if (target < 0 || target == source) return;
+    proposals[v] = target;
+    gains[v] = best_affinity[v] - current_affinity[v];
+    proposal_ties[v] = static_cast<std::uint32_t>(best_ties[v] >> 32);
 }
 
 struct SclpProposalOrder {
     const std::int32_t* targets;
-    const unsigned long long* affinities;
+    const unsigned long long* gains;
+    const std::uint32_t* ties;
     __device__ bool operator()(std::int32_t a, std::int32_t b) const {
         const auto ta = targets[a];
         const auto tb = targets[b];
         if (ta != tb) return ta < tb;
-        const auto aa = affinities[a];
-        const auto ab = affinities[b];
+        const auto aa = gains[a];
+        const auto ab = gains[b];
         if (aa != ab) return aa > ab;
+        if (ties[a] != ties[b]) return ties[a] > ties[b];
         return a < b;
     }
 };
@@ -1633,8 +1697,10 @@ __global__ void sclp_commit_kernel(
     const std::int32_t* targets, const std::uint64_t* weights,
     const std::uint64_t* prefix_weights,
     const unsigned long long* base_cluster_weights, std::uint64_t capacity,
+    const unsigned long long* gains,
     std::int32_t* clusters, unsigned long long* cluster_weights,
-    unsigned long long* accepted, unsigned long long* rejected) {
+    unsigned long long* accepted, unsigned long long* rejected,
+    unsigned long long* predicted_gain) {
     const auto i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) return;
     const auto target = targets[i];
@@ -1648,6 +1714,7 @@ __global__ void sclp_commit_kernel(
         atomicAdd(cluster_weights + target, weight);
         clusters[v] = target;
         atomicAdd(accepted, 1ULL);
+        atomicAdd(predicted_gain, gains[v]);
     } else {
         atomicAdd(rejected, 1ULL);
     }
@@ -1664,33 +1731,30 @@ __global__ void sclp_singleton_favorite_kernel(
         ? proposals[v] : SCLP_INVALID;
 }
 
-__global__ void sclp_group_leader_kernel(
+__global__ void sclp_pair_flags_kernel(
     std::int64_t count, const std::int32_t* order,
-    const std::int32_t* favorites, const std::int32_t* clusters,
-    std::int32_t* leader_values) {
+    const std::uint64_t* ordered_weights,
+    const std::uint64_t* ranks, std::uint64_t capacity,
+    std::int32_t* pair_flags) {
     const auto i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) return;
-    if (i == 0 || favorites[i] != favorites[i - 1]) {
-        leader_values[i] = clusters[order[i]];
-    } else {
-        leader_values[i] = SCLP_INVALID;
-    }
+    const bool second = (ranks[i] & 1ULL) == 0ULL;
+    pair_flags[i] = second && i > 0 &&
+        ordered_weights[i - 1] <= capacity - ordered_weights[i] ? 1 : 0;
 }
 
-__global__ void sclp_two_hop_commit_kernel(
+__global__ void sclp_two_hop_pair_commit_kernel(
     std::int64_t count, const std::int32_t* order,
-    const std::int32_t* favorites, const std::int32_t* leaders,
-    const std::uint64_t* weights, const std::uint64_t* prefix_weights,
-    std::uint64_t capacity, std::int32_t* clusters,
+    const std::int32_t* pair_flags, const std::int32_t* pair_positions,
+    std::uint64_t merge_budget, const std::uint64_t* weights,
+    std::int32_t* clusters,
     unsigned long long* cluster_weights, unsigned long long* merged) {
     const auto i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= count || prefix_weights[i] > capacity) return;
-    const bool has_peer = (i > 0 && favorites[i - 1] == favorites[i]) ||
-                          (i + 1 < count && favorites[i + 1] == favorites[i]);
-    if (!has_peer) return;
+    if (i >= count || !pair_flags[i] ||
+        static_cast<std::uint64_t>(pair_positions[i]) >= merge_budget) return;
     const auto v = order[i];
     const auto source = clusters[v];
-    const auto target = leaders[i];
+    const auto target = clusters[order[i - 1]];
     if (source == target) return;
     const auto weight = static_cast<unsigned long long>(weights[i]);
     atomicAdd(cluster_weights + source, 0ULL - weight);
@@ -3289,6 +3353,12 @@ DeviceAggregateResult gpu_sclp_aggregate_device(
     thrust::device_vector<std::uint64_t> unique_values(static_cast<std::size_t>(m));
     thrust::device_vector<unsigned long long> best_affinity(
         static_cast<std::size_t>(n));
+    thrust::device_vector<unsigned long long> current_affinity(
+        static_cast<std::size_t>(n));
+    thrust::device_vector<unsigned long long> best_ties(
+        static_cast<std::size_t>(n));
+    thrust::device_vector<unsigned long long> gains(static_cast<std::size_t>(n));
+    thrust::device_vector<std::uint32_t> proposal_ties(static_cast<std::size_t>(n));
     thrust::device_vector<std::int32_t> proposals(static_cast<std::size_t>(n));
     thrust::device_vector<std::int32_t> order(static_cast<std::size_t>(n));
     thrust::device_vector<std::int32_t> ordered_targets(static_cast<std::size_t>(n));
@@ -3296,9 +3366,30 @@ DeviceAggregateResult gpu_sclp_aggregate_device(
     thrust::device_vector<std::uint64_t> prefix_weights(static_cast<std::size_t>(n));
     thrust::device_vector<unsigned long long> base_cluster_weights(
         static_cast<std::size_t>(n));
-    thrust::device_vector<unsigned long long> counters(2, 0ULL);
+    thrust::device_vector<unsigned long long> counters(3, 0ULL);
+    thrust::device_vector<unsigned long long> cut_counter(1, 0ULL);
+    const auto device_cluster_cut = [&]() {
+        CUDA_CHECK(cudaMemset(thrust::raw_pointer_cast(cut_counter.data()), 0,
+                              sizeof(unsigned long long)));
+        weighted_cut_kernel<<<vertex_blocks, 256>>>(
+            n, thrust::raw_pointer_cast(graph.offsets.data()),
+            thrust::raw_pointer_cast(graph.neighbors.data()),
+            thrust::raw_pointer_cast(graph.edge_weights.data()),
+            thrust::raw_pointer_cast(clusters.data()),
+            thrust::raw_pointer_cast(cut_counter.data()));
+        CUDA_CHECK(cudaGetLastError());
+        unsigned long long directed = 0;
+        CUDA_CHECK(cudaMemcpy(&directed,
+            thrust::raw_pointer_cast(cut_counter.data()), sizeof(directed),
+            cudaMemcpyDeviceToHost));
+        if (directed & 1ULL) {
+            throw std::runtime_error("SCLP cluster cut is not symmetric");
+        }
+        return static_cast<std::uint64_t>(directed / 2);
+    };
 
-    auto form_exact_proposals = [&]() {
+    auto form_exact_proposals = [&, level, seed](
+        int round, bool filter_roles, std::uint32_t mover_threshold) {
         const auto start = std::chrono::steady_clock::now();
         if (low_count > 0) {
             const int blocks = static_cast<int>((low_count + 255) / 256);
@@ -3339,50 +3430,84 @@ DeviceAggregateResult gpu_sclp_aggregate_device(
         thrust::sort_by_key(
             thrust::device, affinity_keys.begin(), affinity_keys.end(),
             affinity_values.begin());
-        const auto reduced = thrust::reduce_by_key(
+        const auto valid_end = thrust::lower_bound(
             thrust::device, affinity_keys.begin(), affinity_keys.end(),
+            BASC_INVALID_KEY);
+        const auto reduced = thrust::reduce_by_key(
+            thrust::device, affinity_keys.begin(), valid_end,
             affinity_values.begin(), unique_keys.begin(), unique_values.begin());
         const auto unique_count = static_cast<std::int64_t>(
             reduced.first - unique_keys.begin());
         thrust::fill(best_affinity.begin(), best_affinity.end(), 0ULL);
-        thrust::fill(proposals.begin(), proposals.end(),
-                     SCLP_INVALID);
+        thrust::fill(current_affinity.begin(), current_affinity.end(), 0ULL);
+        thrust::fill(best_ties.begin(), best_ties.end(), 0ULL);
+        const auto role_salt = seed ^
+            (static_cast<std::uint32_t>(level) * 0x9e3779b9U) ^
+            (static_cast<std::uint32_t>(round) * 0x85ebca6bU) ^ 0x27d4eb2dU;
+        const auto tie_salt = seed ^
+            (static_cast<std::uint32_t>(level) * 0xc2b2ae35U) ^
+            (static_cast<std::uint32_t>(round) * 0x165667b1U) ^ 0xd3a2646cU;
         if (unique_count > 0) {
             const int blocks = static_cast<int>((unique_count + 255) / 256);
-            sclp_best_affinity_kernel<<<blocks, 256>>>(
+            sclp_affinity_baseline_kernel<<<blocks, 256>>>(
                 unique_count, thrust::raw_pointer_cast(unique_keys.data()),
                 thrust::raw_pointer_cast(unique_values.data()),
                 thrust::raw_pointer_cast(clusters.data()),
+                role_salt, mover_threshold, filter_roles,
+                thrust::raw_pointer_cast(current_affinity.data()),
                 thrust::raw_pointer_cast(best_affinity.data()));
             CUDA_CHECK(cudaGetLastError());
-            sclp_best_target_kernel<<<blocks, 256>>>(
+            sclp_best_tie_kernel<<<blocks, 256>>>(
                 unique_count, thrust::raw_pointer_cast(unique_keys.data()),
                 thrust::raw_pointer_cast(unique_values.data()),
                 thrust::raw_pointer_cast(clusters.data()),
                 thrust::raw_pointer_cast(best_affinity.data()),
-                thrust::raw_pointer_cast(proposals.data()));
+                tie_salt, role_salt, mover_threshold, filter_roles,
+                thrust::raw_pointer_cast(best_ties.data()));
             CUDA_CHECK(cudaGetLastError());
         }
+        sclp_decode_gain_kernel<<<vertex_blocks, 256>>>(
+            n, thrust::raw_pointer_cast(clusters.data()),
+            thrust::raw_pointer_cast(current_affinity.data()),
+            thrust::raw_pointer_cast(best_affinity.data()),
+            thrust::raw_pointer_cast(best_ties.data()),
+            role_salt, mover_threshold, filter_roles,
+            thrust::raw_pointer_cast(proposals.data()),
+            thrust::raw_pointer_cast(gains.data()),
+            thrust::raw_pointer_cast(proposal_ties.data()));
+        CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
         stats.affinity_seconds += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - start).count();
     };
 
     std::int64_t cluster_count = n;
+    const std::int64_t desired_clusters = (n + 1) / 2;
     for (int round = 0; round < maximum_rounds; ++round) {
-        form_exact_proposals();
+        if (static_cast<double>(cluster_count) <= 0.60 * n) break;
+        const auto removable_clusters = std::max<std::int64_t>(
+            0, cluster_count - desired_clusters);
+        const double mover_fraction = std::min(
+            0.50, static_cast<double>(removable_clusters) /
+                  static_cast<double>(cluster_count));
+        const auto mover_threshold = static_cast<std::uint32_t>(
+            mover_fraction * 4294967296.0);
+        form_exact_proposals(round, true, mover_threshold);
         const auto admission_start = std::chrono::steady_clock::now();
+        const auto cut_before = diagnostics ? device_cluster_cut() : 0;
         thrust::sequence(order.begin(), order.end());
         thrust::sort(
             thrust::device, order.begin(), order.end(),
             SclpProposalOrder{
                 thrust::raw_pointer_cast(proposals.data()),
-                thrust::raw_pointer_cast(best_affinity.data())});
+                thrust::raw_pointer_cast(gains.data()),
+                thrust::raw_pointer_cast(proposal_ties.data())});
         const auto valid_count = static_cast<std::int64_t>(thrust::count_if(
             thrust::device, order.begin(), order.end(),
             SclpHasProposal{thrust::raw_pointer_cast(proposals.data())}));
         unsigned long long accepted = 0;
         unsigned long long rejected = 0;
+        unsigned long long predicted_gain = 0;
         if (valid_count > 0) {
             const int blocks = static_cast<int>((valid_count + 255) / 256);
             frontier_ordered_proposal_data_kernel<<<blocks, 256>>>(
@@ -3399,17 +3524,19 @@ DeviceAggregateResult gpu_sclp_aggregate_device(
             thrust::copy(cluster_weights.begin(), cluster_weights.end(),
                          base_cluster_weights.begin());
             CUDA_CHECK(cudaMemset(thrust::raw_pointer_cast(counters.data()), 0,
-                                  2 * sizeof(unsigned long long)));
+                                  3 * sizeof(unsigned long long)));
             sclp_commit_kernel<<<blocks, 256>>>(
                 valid_count, thrust::raw_pointer_cast(order.data()),
                 thrust::raw_pointer_cast(ordered_targets.data()),
                 thrust::raw_pointer_cast(ordered_weights.data()),
                 thrust::raw_pointer_cast(prefix_weights.data()),
                 thrust::raw_pointer_cast(base_cluster_weights.data()),
-                stats.capacity, thrust::raw_pointer_cast(clusters.data()),
+                stats.capacity, thrust::raw_pointer_cast(gains.data()),
+                thrust::raw_pointer_cast(clusters.data()),
                 thrust::raw_pointer_cast(cluster_weights.data()),
                 thrust::raw_pointer_cast(counters.data()),
-                thrust::raw_pointer_cast(counters.data()) + 1);
+                thrust::raw_pointer_cast(counters.data()) + 1,
+                thrust::raw_pointer_cast(counters.data()) + 2);
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaMemcpy(&accepted,
                 thrust::raw_pointer_cast(counters.data()), sizeof(accepted),
@@ -3417,6 +3544,9 @@ DeviceAggregateResult gpu_sclp_aggregate_device(
             CUDA_CHECK(cudaMemcpy(&rejected,
                 thrust::raw_pointer_cast(counters.data()) + 1, sizeof(rejected),
                 cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(&predicted_gain,
+                thrust::raw_pointer_cast(counters.data()) + 2,
+                sizeof(predicted_gain), cudaMemcpyDeviceToHost));
         }
         cluster_count = static_cast<std::int64_t>(thrust::count_if(
             cluster_weights.begin(), cluster_weights.end(), SclpNonzeroWeight{}));
@@ -3425,16 +3555,28 @@ DeviceAggregateResult gpu_sclp_aggregate_device(
         ++stats.rounds;
         stats.admission_seconds += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - admission_start).count();
+        const auto cut_after = diagnostics ? device_cluster_cut() : 0;
+        if (diagnostics && cut_after > cut_before) {
+            throw std::runtime_error("SCLP synchronous batch increased cluster cut");
+        }
         std::cout << "ml_gpu_sclp_round level=" << level
                   << " round=" << round
                   << " proposals=" << valid_count
                   << " accepted=" << accepted
                   << " capacity_rejected=" << rejected
+                  << " predicted_gain=" << predicted_gain;
+        if (diagnostics) {
+            std::cout << " cut_before=" << cut_before
+                      << " cut_after=" << cut_after
+                      << " actual_gain=" << (cut_before - cut_after);
+        }
+        std::cout
+                  << " mover_fraction=" << mover_fraction
                   << " clusters=" << cluster_count
                   << " contraction_ratio="
                   << static_cast<double>(cluster_count) / static_cast<double>(n)
                   << '\n';
-        if (static_cast<double>(cluster_count) <= required_ratio * n) break;
+        if (static_cast<double>(cluster_count) <= 0.60 * n) break;
     }
 
     // Simple two-hop fallback: remaining singleton vertices with the same
@@ -3442,7 +3584,8 @@ DeviceAggregateResult gpu_sclp_aggregate_device(
     // This is a fallback, not part of the SCLP quality claim.
     if (static_cast<double>(cluster_count) > required_ratio * n) {
         const auto fallback_start = std::chrono::steady_clock::now();
-        form_exact_proposals();
+        const auto fallback_cut_before = diagnostics ? device_cluster_cut() : 0;
+        form_exact_proposals(maximum_rounds, false, 0);
         thrust::device_vector<std::int32_t> favorites(static_cast<std::size_t>(n));
         sclp_singleton_favorite_kernel<<<vertex_blocks, 256>>>(
             n, thrust::raw_pointer_cast(graph.vertex_weights.data()),
@@ -3456,7 +3599,8 @@ DeviceAggregateResult gpu_sclp_aggregate_device(
             thrust::device, order.begin(), order.end(),
             SclpProposalOrder{
                 thrust::raw_pointer_cast(favorites.data()),
-                thrust::raw_pointer_cast(best_affinity.data())});
+                thrust::raw_pointer_cast(gains.data()),
+                thrust::raw_pointer_cast(proposal_ties.data())});
         const auto singleton_candidates = static_cast<std::int64_t>(thrust::count_if(
             thrust::device, order.begin(), order.end(),
             SclpHasProposal{thrust::raw_pointer_cast(favorites.data())}));
@@ -3469,33 +3613,35 @@ DeviceAggregateResult gpu_sclp_aggregate_device(
                 thrust::raw_pointer_cast(ordered_targets.data()),
                 thrust::raw_pointer_cast(ordered_weights.data()));
             CUDA_CHECK(cudaGetLastError());
+            thrust::device_vector<std::uint64_t> pair_ones(
+                static_cast<std::size_t>(singleton_candidates), 1);
+            thrust::device_vector<std::uint64_t> pair_ranks(
+                static_cast<std::size_t>(singleton_candidates));
             thrust::inclusive_scan_by_key(
                 thrust::device, ordered_targets.begin(),
                 ordered_targets.begin() + singleton_candidates,
-                ordered_weights.begin(), prefix_weights.begin());
-            thrust::device_vector<std::int32_t> leader_values(
+                pair_ones.begin(), pair_ranks.begin());
+            thrust::device_vector<std::int32_t> pair_flags(
                 static_cast<std::size_t>(singleton_candidates));
-            thrust::device_vector<std::int32_t> leaders(
+            thrust::device_vector<std::int32_t> pair_positions(
                 static_cast<std::size_t>(singleton_candidates));
-            sclp_group_leader_kernel<<<blocks, 256>>>(
+            sclp_pair_flags_kernel<<<blocks, 256>>>(
                 singleton_candidates, thrust::raw_pointer_cast(order.data()),
-                thrust::raw_pointer_cast(ordered_targets.data()),
-                thrust::raw_pointer_cast(clusters.data()),
-                thrust::raw_pointer_cast(leader_values.data()));
+                thrust::raw_pointer_cast(ordered_weights.data()),
+                thrust::raw_pointer_cast(pair_ranks.data()), stats.capacity,
+                thrust::raw_pointer_cast(pair_flags.data()));
             CUDA_CHECK(cudaGetLastError());
-            thrust::inclusive_scan_by_key(
-                thrust::device, ordered_targets.begin(),
-                ordered_targets.begin() + singleton_candidates,
-                leader_values.begin(), leaders.begin(),
-                thrust::equal_to<std::int32_t>(), thrust::minimum<std::int32_t>());
+            thrust::exclusive_scan(
+                pair_flags.begin(), pair_flags.end(), pair_positions.begin());
+            const auto merge_budget = static_cast<std::uint64_t>(
+                std::max<std::int64_t>(0, cluster_count - desired_clusters));
             CUDA_CHECK(cudaMemset(thrust::raw_pointer_cast(counters.data()), 0,
                                   sizeof(unsigned long long)));
-            sclp_two_hop_commit_kernel<<<blocks, 256>>>(
+            sclp_two_hop_pair_commit_kernel<<<blocks, 256>>>(
                 singleton_candidates, thrust::raw_pointer_cast(order.data()),
-                thrust::raw_pointer_cast(ordered_targets.data()),
-                thrust::raw_pointer_cast(leaders.data()),
+                thrust::raw_pointer_cast(pair_flags.data()),
+                thrust::raw_pointer_cast(pair_positions.data()), merge_budget,
                 thrust::raw_pointer_cast(ordered_weights.data()),
-                thrust::raw_pointer_cast(prefix_weights.data()), stats.capacity,
                 thrust::raw_pointer_cast(clusters.data()),
                 thrust::raw_pointer_cast(cluster_weights.data()),
                 thrust::raw_pointer_cast(counters.data()));
@@ -3506,6 +3652,18 @@ DeviceAggregateResult gpu_sclp_aggregate_device(
         }
         cluster_count = static_cast<std::int64_t>(thrust::count_if(
             cluster_weights.begin(), cluster_weights.end(), SclpNonzeroWeight{}));
+        if (diagnostics) {
+            const auto fallback_cut_after = device_cluster_cut();
+            if (fallback_cut_after > fallback_cut_before) {
+                throw std::runtime_error("SCLP two-hop pairing increased cluster cut");
+            }
+            std::cout << "ml_gpu_sclp_two_hop level=" << level
+                      << " merged=" << stats.two_hop_merged
+                      << " cut_before=" << fallback_cut_before
+                      << " cut_after=" << fallback_cut_after
+                      << " actual_gain="
+                      << (fallback_cut_before - fallback_cut_after) << '\n';
+        }
         stats.two_hop_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - fallback_start).count();
     }

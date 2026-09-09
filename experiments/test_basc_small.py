@@ -146,6 +146,13 @@ def main() -> None:
                 print(text, file=sys.stderr)
                 raise
             assert "projection_cut=ok" in text
+            if method == "sclp":
+                assert "predicted_gain=" in text and "mover_fraction=" in text
+                actual_gains = [int(x) for x in re.findall(r"actual_gain=(\d+)", text)]
+                assert actual_gains and all(gain >= 0 for gain in actual_gains)
+                ratios = [float(x) for x in re.findall(
+                    r"ml_gpu_sclp level=0 .*?contraction_ratio=([0-9.e+-]+)", text)]
+                assert ratios and 0.45 <= ratios[0] <= 0.60
     print(f"{method} small hierarchy, capacity, symmetry, coverage, and cut tests passed")
 
 
