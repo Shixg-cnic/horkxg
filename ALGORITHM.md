@@ -57,6 +57,43 @@ SHA256。该事实由 `experiments/test_basc_repeatability.py --method basc_gpu`
 记录，不把 seed=0 当作确定性证明。后续若需要严格复现实验，应增加 GPU 分段
 前缀容量预留，而不是继续依赖 atomic 竞争顺序。
 
+## 目标引导多源前沿粗化
+
+`coarsen_method=frontier` 实现独立于 BASC 的 target-guided seeded frontier
+路径。每层目标粗点数为 `max(C_min, ceil(n/r))`，默认 `r=8`。算法先按确定性
+priority 选取约一半 degree-local-maximum 热种子，再从其一跳未覆盖区域选择冷
+种子。所有 seed 从单点簇出发，GPU warp 按当前前沿扫描 CSR，按真实邻接标签
+权重和剩余容量评分；低置信候选最多推迟两轮。
+
+同一轮 proposal 基于冻结标签快照生成。proposal 按目标簇、分数降序和顶点号
+排序，使用 segmented prefix sum 做确定性容量 admission，提交后才生成下一轮
+前沿。无法从已有簇到达的剩余区域以确定性的局部极大点产生 emergency seed，
+保证孤立点和断开分量终止。增长完成后执行两轮短边界 relabel；同轮迁移点采用
+非邻接局部竞争，并再次用分段前缀和控制目标容量，因此被接受迁移的收益可以相加。
+
+当前层图、映射、权重以及 sort/reduce contraction 全部驻留 GPU。每层 host
+snapshot 仅用于完整层次导出给 Jet；设置 `ML_SKIP_HIERARCHY_EXPORT=1` 可在性能
+诊断时跳过最终文件写入，但正式 Jet 对照不能使用该选项。关键配置为：
+
+```bash
+FRONTIER_CONTRACTION_FACTOR=8   # r
+FRONTIER_CAPACITY_SLACK=0.20    # 簇容量松弛
+FRONTIER_HOT_RATIO=0.50         # 热种子比例
+FRONTIER_DIAGNOSTICS=1          # 逐轮计数和边界收益核验
+FRONTIER_VERIFY=1               # 每层完整结构检查
+```
+
+默认参数不按图名或 k 特化。相同 seed 的确定性来自稳定排序和分段前缀 admission，
+不依赖 CUDA atomic 的到达顺序。严格小图覆盖自环、平行边、孤立点、断开分量、
+非单位点权和投影切边守恒；边界阶段还会比较完整重算切边下降量与接受收益之和。
+
+该版本目前有一个明确限制：目标粗点数是规划目标，不是无条件保证。在幂律图中，
+冻结增长加局部簇容量会形成空间屏障，未分配区域需要 emergency seed，实际粗点数
+可能明显高于目标。products/k=4/seed=0 已观察到该现象；增大容量松弛虽减少紧急
+种子，但固定 Jet 后半段的最终切边变差，因此没有把探测参数改成默认值，也没有
+据此宣称质量改善。数值结果保存在 sibling `single_gpu_lp_baseline` 的实验报告和
+产物目录，本代码仓库不存放大型实验输出。
+
 ## 可复核实验
 
 小图正确性测试：
@@ -72,6 +109,8 @@ GPU_LP_STRICT_VERIFY=1 BASC_TEST_METHOD=basc \
   python3 experiments/test_basc_small.py
 GPU_LP_STRICT_VERIFY=1 BASC_TEST_METHOD=basc_gpu \
   python3 experiments/test_basc_small.py
+GPU_LP_STRICT_VERIFY=1 FRONTIER_DIAGNOSTICS=1 BASC_TEST_METHOD=frontier \
+  python3 experiments/test_basc_small.py
 python3 experiments/test_basc_repeatability.py --method basc_gpu \
   --indptr ../dataset/Gpartition_dataset/Sym_CSR/kim2/kim2_sym_indptr.bin \
   --indices ../dataset/Gpartition_dataset/Sym_CSR/kim2/kim2_sym_indices.bin \
@@ -83,7 +122,9 @@ Jet 后半段对照和结果表：
 ```bash
 METHOD=basc_gpu BASC_K=2 STOP_RATIO=0.90 MAX_LEVELS=24 \
   experiments/run_gpu_lp_jet_compare.sh products com-LiveJournal
+METHOD=frontier FRONTIER_CONTRACTION_FACTOR=8 \
+  FRONTIER_CAPACITY_SLACK=0.20 FRONTIER_HOT_RATIO=0.50 \
+  experiments/run_gpu_lp_jet_compare.sh products
 ```
 
-完整结果与当前限制见
-[`GPU_LP_JET_COARSEN_EXPERIMENT_20260909.md`](GPU_LP_JET_COARSEN_EXPERIMENT_20260909.md)。
+完整结果和大型产物保存在 sibling `single_gpu_lp_baseline` 项目中。

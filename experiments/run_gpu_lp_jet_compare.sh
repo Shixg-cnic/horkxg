@@ -20,10 +20,13 @@ STOP_RATIO="${STOP_RATIO:-0.90}"
 METHOD="${METHOD:-lp}"
 BASC_K="${BASC_K:-2}"
 MAX_LEVELS="${MAX_LEVELS:-24}"
+FRONTIER_CONTRACTION_FACTOR="${FRONTIER_CONTRACTION_FACTOR:-8}"
+FRONTIER_CAPACITY_SLACK="${FRONTIER_CAPACITY_SLACK:-0.20}"
+FRONTIER_HOT_RATIO="${FRONTIER_HOT_RATIO:-0.50}"
 
 case "$METHOD" in
-    lp|basc|basc_gpu) ;;
-    *) echo "METHOD must be lp, basc, or basc_gpu" >&2; exit 2 ;;
+    lp|basc|basc_gpu|frontier) ;;
+    *) echo "METHOD must be lp, basc, basc_gpu, or frontier" >&2; exit 2 ;;
 esac
 
 if [[ "$#" -gt 0 ]]; then
@@ -44,6 +47,10 @@ for dataset in "${DATASETS[@]}"; do
         method_tag="basc_k${BASC_K}"
     elif [[ "$METHOD" == "basc_gpu" ]]; then
         method_tag="basc_gpu_k${BASC_K}"
+    elif [[ "$METHOD" == "frontier" ]]; then
+        frontier_slack_tag="${FRONTIER_CAPACITY_SLACK//./p}"
+        frontier_hot_tag="${FRONTIER_HOT_RATIO//./p}"
+        method_tag="frontier_r${FRONTIER_CONTRACTION_FACTOR}_s${frontier_slack_tag}_h${frontier_hot_tag}"
     else
         method_tag="lp"
     fi

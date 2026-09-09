@@ -113,8 +113,8 @@ def check(path: Path, capacities: list[int]) -> None:
 def main() -> None:
     binary = Path(os.environ.get("MULTILEVEL_BIN", "build-gh200/multilevel_lp"))
     method = os.environ.get("BASC_TEST_METHOD", "basc")
-    if method not in {"basc", "basc_gpu"}:
-        raise SystemExit("BASC_TEST_METHOD must be basc or basc_gpu")
+    if method not in {"basc", "basc_gpu", "frontier"}:
+        raise SystemExit("BASC_TEST_METHOD must be basc, basc_gpu, or frontier")
     with tempfile.TemporaryDirectory(prefix="basc-small-") as tmp:
         root = Path(tmp)
         offsets, indices = make_graph()
@@ -130,7 +130,7 @@ def main() -> None:
             )
             text = log.read_text()
             capacities = [int(x) for x in re.findall(
-                r"ml_gpu_basc(?:_device)? .*?cluster_cap=(\d+)", text)]
+                r"ml_gpu_(?:basc(?:_device)?|frontier) .*?cluster_cap=(\d+)", text)]
             check(out, capacities)
             assert "projection_cut=ok" in text
     print(f"{method} small hierarchy, capacity, symmetry, coverage, and cut tests passed")

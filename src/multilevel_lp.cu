@@ -23,6 +23,7 @@
 #include <thrust/functional.h>
 #include <thrust/reduce.h>
 #include <thrust/scan.h>
+#include <thrust/sequence.h>
 #include <thrust/sort.h>
 #include <thrust/transform.h>
 #include <unordered_map>
@@ -282,6 +283,26 @@ struct BascStats {
     double support_seconds = 0.0;
     double admission_seconds = 0.0;
     double expansion_seconds = 0.0;
+};
+
+struct FrontierStats {
+    std::int64_t target_clusters = 0;
+    std::uint64_t hot_seeds = 0;
+    std::uint64_t cold_seeds = 0;
+    std::uint64_t cold_seed_rounds = 0;
+    std::uint64_t emergency_seeds = 0;
+    std::uint64_t proposed = 0;
+    std::uint64_t postponed = 0;
+    std::uint64_t accepted = 0;
+    std::uint64_t capacity_rejected = 0;
+    std::uint64_t growth_rounds = 0;
+    std::uint64_t boundary_rounds = 0;
+    std::uint64_t boundary_moved = 0;
+    std::uint64_t boundary_gain = 0;
+    std::uint64_t cluster_cap = 0;
+    double seed_seconds = 0.0;
+    double growth_seconds = 0.0;
+    double boundary_seconds = 0.0;
 };
 
 __global__ void basc_priority_kernel(
@@ -895,6 +916,588 @@ __global__ void basc_write_coarse_edges_kernel(
     if (i >= count) return;
     neighbors[i] = static_cast<std::int32_t>(keys[i]);
     edge_weights[i] = values[i];
+}
+
+constexpr int FRONTIER_LABEL_K = 4;
+
+__global__ void frontier_degree_kernel(
+    std::int64_t n, const std::int64_t* offsets, std::int64_t* degrees) {
+    const auto v = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (v < n) degrees[v] = offsets[v + 1] - offsets[v];
+}
+
+__global__ void frontier_local_degree_max_kernel(
+    std::int64_t n, const std::int64_t* offsets,
+    const std::int32_t* neighbors, const std::int64_t* degrees,
+    std::uint8_t* local_maximum) {
+    const int lane = threadIdx.x & (BASC_WARP_SIZE - 1);
+    const auto warp = static_cast<std::int64_t>(blockIdx.x) *
+                      BASC_WARPS_PER_BLOCK + threadIdx.x / BASC_WARP_SIZE;
+    if (warp >= n) return;
+    const unsigned mask = __activemask();
+    bool dominated = false;
+    for (auto e = offsets[warp] + lane; e < offsets[warp + 1]; e += BASC_WARP_SIZE) {
+        const auto u = neighbors[e];
+        if (degrees[u] > degrees[warp] ||
+            (degrees[u] == degrees[warp] && u < warp)) {
+            dominated = true;
+        }
+    }
+    const bool any = __any_sync(mask, dominated);
+    if (lane == 0) local_maximum[warp] = any ? 0 : 1;
+}
+
+__global__ void frontier_hot_scores_kernel(
+    std::int64_t n, const std::int64_t* degrees,
+    const std::uint8_t* local_maximum, double inverse_log_max_degree,
+    float* scores) {
+    const auto v = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (v >= n) return;
+    const auto degree = degrees[v];
+    const float hotness = degree == 0 ? 0.0f : static_cast<float>(
+        log1p(static_cast<double>(degree)) * inverse_log_max_degree);
+    // Local maxima always precede fallback vertices.  Isolated vertices are
+    // left for the cold pool unless there are not enough non-isolated seeds.
+    scores[v] = degree > 0
+        ? (local_maximum[v] ? 4.0f + hotness : 2.0f + hotness)
+        : 0.0f;
+}
+
+__global__ void frontier_initialize_seeds_kernel(
+    std::int64_t count, const std::int32_t* seed_vertices,
+    const std::uint64_t* vertex_weights, std::int32_t* labels,
+    std::uint8_t* seed_mask, unsigned long long* cluster_weights) {
+    const auto i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const auto v = seed_vertices[i];
+    labels[v] = v;
+    seed_mask[v] = 1;
+    cluster_weights[v] = static_cast<unsigned long long>(vertex_weights[v]);
+}
+
+__global__ void frontier_cover_hot_kernel(
+    std::int64_t count, const std::int32_t* hot_vertices,
+    const std::int64_t* offsets, const std::int32_t* neighbors,
+    std::uint8_t* covered) {
+    const int lane = threadIdx.x & (BASC_WARP_SIZE - 1);
+    const auto warp = static_cast<std::int64_t>(blockIdx.x) *
+                      BASC_WARPS_PER_BLOCK + threadIdx.x / BASC_WARP_SIZE;
+    if (warp >= count) return;
+    const auto v = hot_vertices[warp];
+    if (lane == 0) covered[v] = 1;
+    for (auto e = offsets[v] + lane; e < offsets[v + 1]; e += BASC_WARP_SIZE) {
+        covered[neighbors[e]] = 1;
+    }
+}
+
+__global__ void frontier_cold_scores_kernel(
+    std::int64_t n, const std::int64_t* degrees,
+    const std::uint8_t* covered, const std::int32_t* labels,
+    double inverse_log_max_degree, std::uint32_t seed, float* scores) {
+    const auto v = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (v >= n) return;
+    if (labels[v] >= 0) {
+        scores[v] = -3.402823466e+38F;
+        return;
+    }
+    const auto degree = degrees[v];
+    const float hotness = degree == 0 ? 0.0f : static_cast<float>(
+        log1p(static_cast<double>(degree)) * inverse_log_max_degree);
+    const auto bits = mix32(static_cast<std::uint32_t>(v) ^ seed ^ 0x85ebca6bU);
+    const float random_tie = static_cast<float>(bits) / 4294967295.0f;
+    scores[v] = (1.0f - hotness) + 0.1f * random_tie;
+}
+
+__global__ void frontier_cold_local_max_kernel(
+    std::int64_t n, const std::int64_t* offsets,
+    const std::int32_t* neighbors, const std::uint8_t* covered,
+    const std::int32_t* labels, const float* scores,
+    std::uint8_t* local_maximum) {
+    const int lane = threadIdx.x & (BASC_WARP_SIZE - 1);
+    const auto warp = static_cast<std::int64_t>(blockIdx.x) *
+                      BASC_WARPS_PER_BLOCK + threadIdx.x / BASC_WARP_SIZE;
+    if (warp >= n) return;
+    const unsigned mask = __activemask();
+    if (labels[warp] >= 0 || covered[warp]) {
+        if (lane == 0) local_maximum[warp] = 0;
+        return;
+    }
+    bool dominated = false;
+    for (auto e = offsets[warp] + lane; e < offsets[warp + 1]; e += BASC_WARP_SIZE) {
+        const auto u = neighbors[e];
+        if (labels[u] >= 0 || covered[u]) continue;
+        if (scores[u] > scores[warp] ||
+            (scores[u] == scores[warp] && u < warp)) dominated = true;
+    }
+    const bool any = __any_sync(mask, dominated);
+    if (lane == 0) local_maximum[warp] = any ? 0 : 1;
+}
+
+__global__ void frontier_cold_rank_kernel(
+    std::int64_t n, const std::int64_t* degrees,
+    const std::uint8_t* covered,
+    const std::uint8_t* local_maximum, const std::int32_t* labels,
+    float* scores) {
+    const auto v = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (v >= n) return;
+    if (labels[v] >= 0) {
+        scores[v] = -3.402823466e+38F;
+    } else if (!covered[v] && degrees[v] > 1 && local_maximum[v]) {
+        scores[v] += 14.0f;
+    } else if (!covered[v] && local_maximum[v]) {
+        scores[v] += 12.0f;
+    } else if (!covered[v] && degrees[v] > 1) {
+        scores[v] += 8.0f;
+    } else if (!covered[v]) {
+        scores[v] += 4.0f;
+    } else {
+        scores[v] += 2.0f;
+    }
+}
+
+__global__ void frontier_mark_neighbors_kernel(
+    std::int64_t frontier_count, const std::int32_t* frontier,
+    const std::int64_t* offsets, const std::int32_t* neighbors,
+    const std::int32_t* labels, std::int32_t epoch,
+    std::int32_t* active_epoch, std::int32_t* active,
+    unsigned long long* active_count) {
+    const int lane = threadIdx.x & (BASC_WARP_SIZE - 1);
+    const auto warp = static_cast<std::int64_t>(blockIdx.x) *
+                      BASC_WARPS_PER_BLOCK + threadIdx.x / BASC_WARP_SIZE;
+    if (warp >= frontier_count) return;
+    const auto v = frontier[warp];
+    for (auto e = offsets[v] + lane; e < offsets[v + 1]; e += BASC_WARP_SIZE) {
+        const auto u = neighbors[e];
+        if (labels[u] >= 0) continue;
+        const auto previous = atomicExch(
+            reinterpret_cast<int*>(&active_epoch[u]), static_cast<int>(epoch));
+        if (previous != epoch) {
+            const auto slot = atomicAdd(active_count, 1ULL);
+            active[slot] = u;
+        }
+    }
+}
+
+__device__ __forceinline__ void frontier_insert_label_support(
+    std::int32_t label, std::uint64_t weight,
+    std::int32_t* labels, std::uint64_t* support) {
+    if (label < 0) return;
+    int empty = -1;
+    int weakest = 0;
+    for (int j = 0; j < FRONTIER_LABEL_K; ++j) {
+        if (labels[j] == label) {
+            support[j] += weight;
+            return;
+        }
+        if (labels[j] < 0 && empty < 0) empty = j;
+        if (support[j] < support[weakest] ||
+            (support[j] == support[weakest] && labels[j] > labels[weakest])) {
+            weakest = j;
+        }
+    }
+    const int slot = empty >= 0 ? empty : weakest;
+    if (empty < 0 && (weight < support[slot] ||
+        (weight == support[slot] && label > labels[slot]))) return;
+    labels[slot] = label;
+    support[slot] = weight;
+}
+
+__global__ void frontier_growth_propose_kernel(
+    std::int64_t active_count, const std::int32_t* active,
+    const std::int64_t* offsets, const std::int32_t* neighbors,
+    const std::uint64_t* edge_weights, const std::uint64_t* vertex_weights,
+    const std::int32_t* labels, const unsigned long long* cluster_weights,
+    std::uint64_t capacity, float confidence_threshold,
+    std::uint8_t max_postpone, std::uint8_t* postpone,
+    std::int32_t* proposals, float* proposal_scores,
+    unsigned long long* proposed_count, unsigned long long* postponed_count) {
+    __shared__ std::int32_t shared_labels[
+        BASC_WARPS_PER_BLOCK * BASC_WARP_SIZE * FRONTIER_LABEL_K];
+    __shared__ std::uint64_t shared_support[
+        BASC_WARPS_PER_BLOCK * BASC_WARP_SIZE * FRONTIER_LABEL_K];
+    const int lane = threadIdx.x & (BASC_WARP_SIZE - 1);
+    const int local_warp = threadIdx.x / BASC_WARP_SIZE;
+    const auto warp = static_cast<std::int64_t>(blockIdx.x) *
+                      BASC_WARPS_PER_BLOCK + local_warp;
+    if (warp >= active_count) return;
+    const unsigned mask = __activemask();
+    const auto v = active[warp];
+    std::int32_t local_labels[FRONTIER_LABEL_K];
+    std::uint64_t local_support[FRONTIER_LABEL_K];
+    for (int j = 0; j < FRONTIER_LABEL_K; ++j) {
+        local_labels[j] = BASC_INVALID;
+        local_support[j] = 0;
+    }
+    std::uint64_t total_labeled = 0;
+    if (labels[v] < 0) {
+        for (auto e = offsets[v] + lane; e < offsets[v + 1]; e += BASC_WARP_SIZE) {
+            const auto label = labels[neighbors[e]];
+            if (label < 0) continue;
+            const auto weight = edge_weights[e];
+            total_labeled += weight;
+            frontier_insert_label_support(
+                label, weight, local_labels, local_support);
+        }
+    }
+    const auto base = local_warp * BASC_WARP_SIZE * FRONTIER_LABEL_K +
+                      lane * FRONTIER_LABEL_K;
+    for (int j = 0; j < FRONTIER_LABEL_K; ++j) {
+        shared_labels[base + j] = local_labels[j];
+        shared_support[base + j] = local_support[j];
+    }
+    __syncwarp(mask);
+    for (int delta = BASC_WARP_SIZE / 2; delta > 0; delta >>= 1) {
+        total_labeled += __shfl_down_sync(mask, total_labeled, delta);
+    }
+    if (lane != 0) return;
+
+    proposals[v] = BASC_INVALID;
+    proposal_scores[v] = -1.0f;
+    if (labels[v] >= 0) return;
+    std::int32_t merged_labels[FRONTIER_LABEL_K];
+    std::uint64_t merged_support[FRONTIER_LABEL_K];
+    for (int j = 0; j < FRONTIER_LABEL_K; ++j) {
+        merged_labels[j] = BASC_INVALID;
+        merged_support[j] = 0;
+    }
+    for (int other = 0; other < BASC_WARP_SIZE; ++other) {
+        const auto other_base = local_warp * BASC_WARP_SIZE * FRONTIER_LABEL_K +
+                                other * FRONTIER_LABEL_K;
+        for (int j = 0; j < FRONTIER_LABEL_K; ++j) {
+            frontier_insert_label_support(
+                shared_labels[other_base + j], shared_support[other_base + j],
+                merged_labels, merged_support);
+        }
+    }
+    int best = -1;
+    float best_score = -1.0f;
+    const auto own_weight = vertex_weights[v];
+    for (int j = 0; j < FRONTIER_LABEL_K; ++j) {
+        const auto label = merged_labels[j];
+        if (label < 0) continue;
+        const auto used = static_cast<std::uint64_t>(cluster_weights[label]);
+        if (used > capacity || own_weight > capacity - used) continue;
+        const float remaining = capacity == 0 ? 0.0f :
+            static_cast<float>(capacity - used) / static_cast<float>(capacity);
+        const float score = static_cast<float>(merged_support[j]) * remaining;
+        if (best < 0 || score > best_score ||
+            (score == best_score && label < merged_labels[best])) {
+            best = j;
+            best_score = score;
+        }
+    }
+    if (best < 0) return;
+    const float confidence = total_labeled == 0 ? 0.0f :
+        static_cast<float>(merged_support[best]) /
+        static_cast<float>(total_labeled);
+    if (confidence < confidence_threshold && postpone[v] < max_postpone) {
+        ++postpone[v];
+        atomicAdd(postponed_count, 1ULL);
+        return;
+    }
+    proposals[v] = merged_labels[best];
+    proposal_scores[v] = best_score;
+    atomicAdd(proposed_count, 1ULL);
+}
+
+struct FrontierProposalOrder {
+    const std::int32_t* proposals;
+    const float* scores;
+    __host__ __device__ bool operator()(std::int32_t a, std::int32_t b) const {
+        const auto pa = proposals[a];
+        const auto pb = proposals[b];
+        if ((pa >= 0) != (pb >= 0)) return pa >= 0;
+        if (pa != pb) return pa < pb;
+        if (scores[a] != scores[b]) return scores[a] > scores[b];
+        return a < b;
+    }
+};
+
+struct FrontierHasProposal {
+    const std::int32_t* proposals;
+    __host__ __device__ bool operator()(std::int32_t v) const {
+        return proposals[v] >= 0;
+    }
+};
+
+__global__ void frontier_ordered_proposal_data_kernel(
+    std::int64_t count, const std::int32_t* order,
+    const std::int32_t* proposals, const std::uint64_t* vertex_weights,
+    std::int32_t* targets, std::uint64_t* weights) {
+    const auto i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const auto v = order[i];
+    targets[i] = proposals[v];
+    weights[i] = vertex_weights[v];
+}
+
+__global__ void frontier_commit_prefix_kernel(
+    std::int64_t count, const std::int32_t* order,
+    const std::int32_t* targets, const std::uint64_t* weights,
+    const std::uint64_t* prefix_weights,
+    const unsigned long long* base_cluster_weights, std::uint64_t capacity,
+    std::int32_t* labels, unsigned long long* cluster_weights,
+    std::int32_t* accepted_frontier, unsigned long long* accepted_count,
+    unsigned long long* rejected_count) {
+    const auto i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const auto target = targets[i];
+    const auto base = static_cast<std::uint64_t>(base_cluster_weights[target]);
+    const auto prefix = prefix_weights[i];
+    if (base <= capacity && prefix <= capacity - base) {
+        const auto v = order[i];
+        labels[v] = target;
+        atomicAdd(&cluster_weights[target],
+                  static_cast<unsigned long long>(weights[i]));
+        const auto slot = atomicAdd(accepted_count, 1ULL);
+        accepted_frontier[slot] = v;
+    } else {
+        atomicAdd(rejected_count, 1ULL);
+    }
+}
+
+__global__ void frontier_carry_unassigned_kernel(
+    std::int64_t count, const std::int32_t* vertices,
+    const std::int32_t* labels, std::int32_t epoch,
+    std::int32_t* active_epoch, std::int32_t* output,
+    unsigned long long* output_count) {
+    const auto i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const auto v = vertices[i];
+    if (labels[v] >= 0) return;
+    const auto previous = atomicExch(
+        reinterpret_cast<int*>(&active_epoch[v]), static_cast<int>(epoch));
+    if (previous != epoch) {
+        const auto slot = atomicAdd(output_count, 1ULL);
+        output[slot] = v;
+    }
+}
+
+__global__ void frontier_emergency_mark_kernel(
+    std::int64_t n, const std::int64_t* offsets,
+    const std::int32_t* neighbors, const float* priority,
+    const std::int32_t* labels, std::int32_t* flags) {
+    const int lane = threadIdx.x & (BASC_WARP_SIZE - 1);
+    const auto warp = static_cast<std::int64_t>(blockIdx.x) *
+                      BASC_WARPS_PER_BLOCK + threadIdx.x / BASC_WARP_SIZE;
+    if (warp >= n) return;
+    const unsigned mask = __activemask();
+    if (labels[warp] >= 0) {
+        if (lane == 0) flags[warp] = 0;
+        return;
+    }
+    bool dominated = false;
+    for (auto e = offsets[warp] + lane; e < offsets[warp + 1]; e += BASC_WARP_SIZE) {
+        const auto u = neighbors[e];
+        if (labels[u] >= 0) continue;
+        if (priority[u] > priority[warp] ||
+            (priority[u] == priority[warp] && u < warp)) dominated = true;
+    }
+    const bool any = __any_sync(mask, dominated);
+    if (lane == 0) flags[warp] = any ? 0 : 1;
+}
+
+__global__ void frontier_compact_flags_kernel(
+    std::int64_t n, const std::int32_t* flags,
+    const std::int32_t* positions, std::int32_t* output) {
+    const auto v = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (v < n && flags[v]) output[positions[v]] = static_cast<std::int32_t>(v);
+}
+
+__global__ void frontier_boundary_propose_kernel(
+    std::int64_t n, const std::int64_t* offsets,
+    const std::int32_t* neighbors, const std::uint64_t* edge_weights,
+    const std::uint64_t* vertex_weights, const std::int32_t* labels,
+    const std::uint8_t* seed_mask,
+    const unsigned long long* cluster_weights, std::uint64_t capacity,
+    std::int32_t* proposals, float* proposal_scores,
+    std::uint64_t* gains) {
+    __shared__ std::int32_t shared_labels[
+        BASC_WARPS_PER_BLOCK * BASC_WARP_SIZE * FRONTIER_LABEL_K];
+    __shared__ std::uint64_t shared_support[
+        BASC_WARPS_PER_BLOCK * BASC_WARP_SIZE * FRONTIER_LABEL_K];
+    const int lane = threadIdx.x & (BASC_WARP_SIZE - 1);
+    const int local_warp = threadIdx.x / BASC_WARP_SIZE;
+    const auto warp = static_cast<std::int64_t>(blockIdx.x) *
+                      BASC_WARPS_PER_BLOCK + local_warp;
+    if (warp >= n) return;
+    const unsigned mask = __activemask();
+    const auto current = labels[warp];
+    std::int32_t local_labels[FRONTIER_LABEL_K];
+    std::uint64_t local_support[FRONTIER_LABEL_K];
+    for (int j = 0; j < FRONTIER_LABEL_K; ++j) {
+        local_labels[j] = BASC_INVALID;
+        local_support[j] = 0;
+    }
+    std::uint64_t current_support = 0;
+    if (!seed_mask[warp]) {
+        for (auto e = offsets[warp] + lane; e < offsets[warp + 1]; e += BASC_WARP_SIZE) {
+            const auto neighbor = neighbors[e];
+            if (neighbor == warp) continue;  // A self-loop is unchanged by relabeling.
+            const auto neighbor_label = labels[neighbor];
+            const auto weight = edge_weights[e];
+            if (neighbor_label == current) current_support += weight;
+            frontier_insert_label_support(
+                neighbor_label, weight, local_labels, local_support);
+        }
+    }
+    const auto base = local_warp * BASC_WARP_SIZE * FRONTIER_LABEL_K +
+                      lane * FRONTIER_LABEL_K;
+    for (int j = 0; j < FRONTIER_LABEL_K; ++j) {
+        shared_labels[base + j] = local_labels[j];
+        shared_support[base + j] = local_support[j];
+    }
+    __syncwarp(mask);
+    for (int delta = BASC_WARP_SIZE / 2; delta > 0; delta >>= 1) {
+        current_support += __shfl_down_sync(mask, current_support, delta);
+    }
+    if (lane != 0) return;
+    proposals[warp] = BASC_INVALID;
+    proposal_scores[warp] = -1.0f;
+    gains[warp] = 0;
+    if (seed_mask[warp]) return;
+
+    std::int32_t merged_labels[FRONTIER_LABEL_K];
+    std::uint64_t merged_support[FRONTIER_LABEL_K];
+    for (int j = 0; j < FRONTIER_LABEL_K; ++j) {
+        merged_labels[j] = BASC_INVALID;
+        merged_support[j] = 0;
+    }
+    for (int other = 0; other < BASC_WARP_SIZE; ++other) {
+        const auto other_base = local_warp * BASC_WARP_SIZE * FRONTIER_LABEL_K +
+                                other * FRONTIER_LABEL_K;
+        for (int j = 0; j < FRONTIER_LABEL_K; ++j) {
+            frontier_insert_label_support(
+                shared_labels[other_base + j], shared_support[other_base + j],
+                merged_labels, merged_support);
+        }
+    }
+    int best = -1;
+    std::uint64_t best_gain = 0;
+    const auto own_weight = vertex_weights[warp];
+    for (int j = 0; j < FRONTIER_LABEL_K; ++j) {
+        const auto target = merged_labels[j];
+        if (target < 0 || target == current || merged_support[j] <= current_support) continue;
+        const auto used = static_cast<std::uint64_t>(cluster_weights[target]);
+        if (used > capacity || own_weight > capacity - used) continue;
+        const auto gain = merged_support[j] - current_support;
+        if (best < 0 || gain > best_gain ||
+            (gain == best_gain && target < merged_labels[best])) {
+            best = j;
+            best_gain = gain;
+        }
+    }
+    if (best >= 0) {
+        proposals[warp] = merged_labels[best];
+        gains[warp] = best_gain;
+        proposal_scores[warp] = static_cast<float>(best_gain);
+    }
+}
+
+__global__ void frontier_boundary_exact_gain_kernel(
+    std::int64_t n, const std::int64_t* offsets,
+    const std::int32_t* neighbors, const std::uint64_t* edge_weights,
+    const std::int32_t* labels, std::int32_t* proposals,
+    float* proposal_scores, std::uint64_t* gains) {
+    const int lane = threadIdx.x & (BASC_WARP_SIZE - 1);
+    const auto warp = static_cast<std::int64_t>(blockIdx.x) *
+                      BASC_WARPS_PER_BLOCK + threadIdx.x / BASC_WARP_SIZE;
+    if (warp >= n) return;
+    const unsigned mask = __activemask();
+    const auto target = proposals[warp];
+    if (target < 0) return;
+    const auto current = labels[warp];
+    std::uint64_t source_support = 0;
+    std::uint64_t target_support = 0;
+    for (auto e = offsets[warp] + lane; e < offsets[warp + 1]; e += BASC_WARP_SIZE) {
+        const auto neighbor = neighbors[e];
+        if (neighbor == warp) continue;
+        const auto neighbor_label = labels[neighbor];
+        if (neighbor_label == current) source_support += edge_weights[e];
+        if (neighbor_label == target) target_support += edge_weights[e];
+    }
+    for (int delta = BASC_WARP_SIZE / 2; delta > 0; delta >>= 1) {
+        source_support += __shfl_down_sync(mask, source_support, delta);
+        target_support += __shfl_down_sync(mask, target_support, delta);
+    }
+    if (lane != 0) return;
+    if (target_support <= source_support) {
+        proposals[warp] = BASC_INVALID;
+        proposal_scores[warp] = -1.0f;
+        gains[warp] = 0;
+        return;
+    }
+    const auto gain = target_support - source_support;
+    gains[warp] = gain;
+    proposal_scores[warp] = static_cast<float>(gain);
+}
+
+__global__ void frontier_boundary_conflict_kernel(
+    std::int64_t n, const std::int64_t* offsets,
+    const std::int32_t* neighbors, const std::int32_t* proposals,
+    const std::uint64_t* gains, std::uint8_t* winners) {
+    const int lane = threadIdx.x & (BASC_WARP_SIZE - 1);
+    const auto warp = static_cast<std::int64_t>(blockIdx.x) *
+                      BASC_WARPS_PER_BLOCK + threadIdx.x / BASC_WARP_SIZE;
+    if (warp >= n) return;
+    const unsigned mask = __activemask();
+    if (proposals[warp] < 0) {
+        if (lane == 0) winners[warp] = 0;
+        return;
+    }
+    bool dominated = false;
+    for (auto e = offsets[warp] + lane; e < offsets[warp + 1]; e += BASC_WARP_SIZE) {
+        const auto u = neighbors[e];
+        if (proposals[u] < 0) continue;
+        if (gains[u] > gains[warp] ||
+            (gains[u] == gains[warp] && u < warp)) dominated = true;
+    }
+    const bool any = __any_sync(mask, dominated);
+    if (lane == 0) winners[warp] = any ? 0 : 1;
+}
+
+__global__ void frontier_apply_boundary_conflicts_kernel(
+    std::int64_t n, const std::uint8_t* winners,
+    std::int32_t* proposals) {
+    const auto v = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (v < n && !winners[v]) proposals[v] = BASC_INVALID;
+}
+
+__global__ void frontier_boundary_commit_kernel(
+    std::int64_t count, const std::int32_t* order,
+    const std::int32_t* targets, const std::uint64_t* weights,
+    const std::uint64_t* prefix_weights,
+    const unsigned long long* base_cluster_weights, std::uint64_t capacity,
+    const std::uint64_t* gains, std::int32_t* labels,
+    unsigned long long* cluster_weights, unsigned long long* moved_count,
+    unsigned long long* total_gain) {
+    const auto i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const auto target = targets[i];
+    const auto base = static_cast<std::uint64_t>(base_cluster_weights[target]);
+    const auto prefix = prefix_weights[i];
+    if (base > capacity || prefix > capacity - base) return;
+    const auto v = order[i];
+    const auto source = labels[v];
+    const auto weight = static_cast<unsigned long long>(weights[i]);
+    atomicAdd(&cluster_weights[source], 0ULL - weight);
+    atomicAdd(&cluster_weights[target], weight);
+    labels[v] = target;
+    atomicAdd(moved_count, 1ULL);
+    atomicAdd(total_gain, static_cast<unsigned long long>(gains[v]));
+}
+
+__global__ void frontier_mark_label_roots_kernel(
+    std::int64_t n, const std::int32_t* labels, std::int32_t* root_flags) {
+    const auto v = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (v < n) root_flags[v] = labels[v] == v ? 1 : 0;
+}
+
+__global__ void frontier_compact_labels_kernel(
+    std::int64_t n, const std::int32_t* labels,
+    const std::int32_t* root_ids, std::int32_t* map) {
+    const auto v = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (v < n) map[v] = root_ids[labels[v]];
 }
 
 std::uint64_t host_cut(
@@ -1751,6 +2354,644 @@ DeviceAggregateResult gpu_basc_aggregate_device(
     return out;
 }
 
+DeviceAggregateResult gpu_frontier_aggregate_device(
+    const DeviceWeightedGraph& graph, int parts, std::uint32_t seed,
+    int level, FrontierStats& stats, bool diagnostics) {
+    const auto n = graph.vertices();
+    if (n <= 0 || n > std::numeric_limits<std::int32_t>::max()) {
+        throw std::runtime_error("frontier coarsening received an unsupported graph size");
+    }
+    const auto read_environment_double = [](
+        const char* name, double fallback, double minimum, double maximum) {
+        const char* raw = std::getenv(name);
+        if (raw == nullptr) return fallback;
+        std::size_t consumed = 0;
+        const double value = std::stod(raw, &consumed);
+        if (raw[consumed] != '\0' || value < minimum || value > maximum) {
+            throw std::runtime_error(std::string("invalid ") + name);
+        }
+        return value;
+    };
+    const double contraction_factor = read_environment_double(
+        "FRONTIER_CONTRACTION_FACTOR", 8.0, 2.0, 64.0);
+    const double capacity_slack = read_environment_double(
+        "FRONTIER_CAPACITY_SLACK", 0.20, 0.0, 4.0);
+    const double hot_ratio = read_environment_double(
+        "FRONTIER_HOT_RATIO", 0.50, 0.0, 1.0);
+    constexpr float confidence_threshold = 0.60f;
+    constexpr std::uint8_t max_postpone = 2;
+    const auto cutoff = std::max<std::int64_t>(32, parts * 8);
+    stats.target_clusters = std::min<std::int64_t>(
+        n, std::max<std::int64_t>(
+            cutoff, static_cast<std::int64_t>(std::ceil(n / contraction_factor))));
+    stats.hot_seeds = static_cast<std::uint64_t>(std::llround(
+        hot_ratio * static_cast<double>(stats.target_clusters)));
+    stats.hot_seeds = std::min<std::uint64_t>(
+        stats.hot_seeds, static_cast<std::uint64_t>(stats.target_clusters));
+    stats.cold_seeds = static_cast<std::uint64_t>(
+        stats.target_clusters - static_cast<std::int64_t>(stats.hot_seeds));
+
+    const int vertex_blocks = static_cast<int>((n + 255) / 256);
+    const int warp_blocks = static_cast<int>(
+        (n + BASC_WARPS_PER_BLOCK - 1) / BASC_WARPS_PER_BLOCK);
+    const auto total_weight = thrust::reduce(
+        graph.vertex_weights.begin(), graph.vertex_weights.end(),
+        std::uint64_t{0}, thrust::plus<std::uint64_t>());
+    const auto maximum_vertex = thrust::reduce(
+        graph.vertex_weights.begin(), graph.vertex_weights.end(),
+        std::uint64_t{0}, thrust::maximum<std::uint64_t>());
+    const auto average_capacity = static_cast<std::uint64_t>(std::ceil(
+        (1.0 + capacity_slack) * static_cast<long double>(total_weight) /
+        static_cast<long double>(stats.target_clusters)));
+    stats.cluster_cap = std::max(maximum_vertex, average_capacity);
+
+    thrust::device_vector<std::int64_t> degrees(static_cast<std::size_t>(n));
+    thrust::device_vector<std::uint8_t> local_maximum(static_cast<std::size_t>(n));
+    thrust::device_vector<float> ranking_scores(static_cast<std::size_t>(n));
+    thrust::device_vector<std::int32_t> ranked_vertices(static_cast<std::size_t>(n));
+    thrust::device_vector<std::int32_t> seed_vertices(
+        static_cast<std::size_t>(stats.target_clusters));
+    thrust::device_vector<std::uint8_t> covered(static_cast<std::size_t>(n), 0);
+    thrust::device_vector<std::uint8_t> cold_local_maximum(
+        static_cast<std::size_t>(n));
+    thrust::device_vector<std::int32_t> labels(
+        static_cast<std::size_t>(n), BASC_INVALID);
+    thrust::device_vector<std::uint8_t> seed_mask(static_cast<std::size_t>(n), 0);
+    thrust::device_vector<unsigned long long> cluster_weights(
+        static_cast<std::size_t>(n), 0ULL);
+    thrust::device_vector<float> emergency_priority(static_cast<std::size_t>(n));
+
+    const auto seed_start = std::chrono::steady_clock::now();
+    frontier_degree_kernel<<<vertex_blocks, 256>>>(
+        n, thrust::raw_pointer_cast(graph.offsets.data()),
+        thrust::raw_pointer_cast(degrees.data()));
+    CUDA_CHECK(cudaGetLastError());
+    frontier_local_degree_max_kernel<<<warp_blocks, 256>>>(
+        n, thrust::raw_pointer_cast(graph.offsets.data()),
+        thrust::raw_pointer_cast(graph.neighbors.data()),
+        thrust::raw_pointer_cast(degrees.data()),
+        thrust::raw_pointer_cast(local_maximum.data()));
+    CUDA_CHECK(cudaGetLastError());
+    const auto maximum_degree = thrust::reduce(
+        degrees.begin(), degrees.end(), std::int64_t{0},
+        thrust::maximum<std::int64_t>());
+    const double inverse_log_max_degree = maximum_degree > 0
+        ? 1.0 / std::log1p(static_cast<double>(maximum_degree)) : 0.0;
+    frontier_hot_scores_kernel<<<vertex_blocks, 256>>>(
+        n, thrust::raw_pointer_cast(degrees.data()),
+        thrust::raw_pointer_cast(local_maximum.data()), inverse_log_max_degree,
+        thrust::raw_pointer_cast(ranking_scores.data()));
+    CUDA_CHECK(cudaGetLastError());
+    thrust::sequence(ranked_vertices.begin(), ranked_vertices.end());
+    thrust::stable_sort_by_key(
+        thrust::device, ranking_scores.begin(), ranking_scores.end(),
+        ranked_vertices.begin(), thrust::greater<float>());
+    thrust::copy_n(
+        ranked_vertices.begin(), static_cast<std::ptrdiff_t>(stats.hot_seeds),
+        seed_vertices.begin());
+    if (stats.hot_seeds > 0) {
+        const int blocks = static_cast<int>((stats.hot_seeds + 255) / 256);
+        frontier_initialize_seeds_kernel<<<blocks, 256>>>(
+            stats.hot_seeds, thrust::raw_pointer_cast(seed_vertices.data()),
+            thrust::raw_pointer_cast(graph.vertex_weights.data()),
+            thrust::raw_pointer_cast(labels.data()),
+            thrust::raw_pointer_cast(seed_mask.data()),
+            thrust::raw_pointer_cast(cluster_weights.data()));
+        CUDA_CHECK(cudaGetLastError());
+        const int hot_warp_blocks = static_cast<int>(
+            (stats.hot_seeds + BASC_WARPS_PER_BLOCK - 1) /
+            BASC_WARPS_PER_BLOCK);
+        frontier_cover_hot_kernel<<<hot_warp_blocks, 256>>>(
+            stats.hot_seeds, thrust::raw_pointer_cast(seed_vertices.data()),
+            thrust::raw_pointer_cast(graph.offsets.data()),
+            thrust::raw_pointer_cast(graph.neighbors.data()),
+            thrust::raw_pointer_cast(covered.data()));
+        CUDA_CHECK(cudaGetLastError());
+    }
+    std::uint64_t cold_selected = 0;
+    while (cold_selected < stats.cold_seeds) {
+        ++stats.cold_seed_rounds;
+        frontier_cold_scores_kernel<<<vertex_blocks, 256>>>(
+            n, thrust::raw_pointer_cast(degrees.data()),
+            thrust::raw_pointer_cast(covered.data()),
+            thrust::raw_pointer_cast(labels.data()), inverse_log_max_degree,
+            seed + static_cast<std::uint32_t>(stats.cold_seed_rounds),
+            thrust::raw_pointer_cast(ranking_scores.data()));
+        CUDA_CHECK(cudaGetLastError());
+        frontier_cold_local_max_kernel<<<warp_blocks, 256>>>(
+            n, thrust::raw_pointer_cast(graph.offsets.data()),
+            thrust::raw_pointer_cast(graph.neighbors.data()),
+            thrust::raw_pointer_cast(covered.data()),
+            thrust::raw_pointer_cast(labels.data()),
+            thrust::raw_pointer_cast(ranking_scores.data()),
+            thrust::raw_pointer_cast(cold_local_maximum.data()));
+        CUDA_CHECK(cudaGetLastError());
+        const auto local_count = static_cast<std::uint64_t>(thrust::count(
+            cold_local_maximum.begin(), cold_local_maximum.end(),
+            static_cast<std::uint8_t>(1)));
+        frontier_cold_rank_kernel<<<vertex_blocks, 256>>>(
+            n, thrust::raw_pointer_cast(degrees.data()),
+            thrust::raw_pointer_cast(covered.data()),
+            thrust::raw_pointer_cast(cold_local_maximum.data()),
+            thrust::raw_pointer_cast(labels.data()),
+            thrust::raw_pointer_cast(ranking_scores.data()));
+        CUDA_CHECK(cudaGetLastError());
+        thrust::sequence(ranked_vertices.begin(), ranked_vertices.end());
+        thrust::stable_sort_by_key(
+            thrust::device, ranking_scores.begin(), ranking_scores.end(),
+            ranked_vertices.begin(), thrust::greater<float>());
+        const auto remaining = stats.cold_seeds - cold_selected;
+        // Take a spatially independent local-max batch.  If the uncovered
+        // induced graph has no candidate, use the ranking as a deterministic
+        // fallback so the requested seed count is still reached.
+        const auto take = static_cast<std::uint64_t>(
+            std::min<std::uint64_t>(remaining, local_count > 0 ? local_count : remaining));
+        thrust::copy_n(
+            ranked_vertices.begin(), static_cast<std::ptrdiff_t>(take),
+            seed_vertices.begin() + static_cast<std::ptrdiff_t>(
+                stats.hot_seeds + cold_selected));
+        const int blocks = static_cast<int>((take + 255) / 256);
+        auto* selected = thrust::raw_pointer_cast(seed_vertices.data()) +
+                         stats.hot_seeds + cold_selected;
+        frontier_initialize_seeds_kernel<<<blocks, 256>>>(
+            take, selected, thrust::raw_pointer_cast(graph.vertex_weights.data()),
+            thrust::raw_pointer_cast(labels.data()),
+            thrust::raw_pointer_cast(seed_mask.data()),
+            thrust::raw_pointer_cast(cluster_weights.data()));
+        CUDA_CHECK(cudaGetLastError());
+        const int cover_blocks = static_cast<int>(
+            (take + BASC_WARPS_PER_BLOCK - 1) / BASC_WARPS_PER_BLOCK);
+        frontier_cover_hot_kernel<<<cover_blocks, 256>>>(
+            take, selected, thrust::raw_pointer_cast(graph.offsets.data()),
+            thrust::raw_pointer_cast(graph.neighbors.data()),
+            thrust::raw_pointer_cast(covered.data()));
+        CUDA_CHECK(cudaGetLastError());
+        cold_selected += take;
+        if (stats.cold_seed_rounds > 32) {
+            throw std::runtime_error("frontier cold seed selection exceeded 32 rounds");
+        }
+    }
+    basc_priority_kernel<<<vertex_blocks, 256>>>(
+        n, thrust::raw_pointer_cast(graph.offsets.data()), seed, 0.25f,
+        thrust::raw_pointer_cast(emergency_priority.data()));
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    stats.seed_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - seed_start).count();
+
+    thrust::device_vector<std::int32_t> frontier(static_cast<std::size_t>(n));
+    thrust::device_vector<std::int32_t> active(static_cast<std::size_t>(n));
+    thrust::device_vector<std::int32_t> next_active(static_cast<std::size_t>(n));
+    thrust::device_vector<std::int32_t> accepted_frontier(static_cast<std::size_t>(n));
+    thrust::device_vector<std::int32_t> active_epoch(
+        static_cast<std::size_t>(n), -1);
+    thrust::device_vector<std::uint8_t> postpone(static_cast<std::size_t>(n), 0);
+    thrust::device_vector<std::int32_t> proposals(
+        static_cast<std::size_t>(n), BASC_INVALID);
+    thrust::device_vector<float> proposal_scores(static_cast<std::size_t>(n), -1.0f);
+    thrust::device_vector<std::int32_t> order(static_cast<std::size_t>(n));
+    thrust::device_vector<std::int32_t> ordered_targets(static_cast<std::size_t>(n));
+    thrust::device_vector<std::uint64_t> ordered_weights(static_cast<std::size_t>(n));
+    thrust::device_vector<std::uint64_t> prefix_weights(static_cast<std::size_t>(n));
+    thrust::device_vector<unsigned long long> base_cluster_weights(
+        static_cast<std::size_t>(n));
+    thrust::device_vector<unsigned long long> proposal_counters(2, 0ULL);
+    thrust::device_vector<unsigned long long> commit_counters(2, 0ULL);
+    thrust::device_vector<unsigned long long> list_counter(1, 0ULL);
+    thrust::device_vector<std::int32_t> emergency_flags(static_cast<std::size_t>(n));
+    thrust::device_vector<std::int32_t> emergency_positions(static_cast<std::size_t>(n));
+
+    thrust::copy(seed_vertices.begin(), seed_vertices.end(), frontier.begin());
+    std::uint64_t assigned = static_cast<std::uint64_t>(stats.target_clusters);
+    std::int64_t frontier_count = stats.target_clusters;
+    std::int32_t epoch = 1;
+    auto mark_neighbors = [&](std::int64_t count,
+                              const thrust::device_vector<std::int32_t>& source,
+                              thrust::device_vector<std::int32_t>& destination) {
+        if (count <= 0) return;
+        const int blocks = static_cast<int>(
+            (count + BASC_WARPS_PER_BLOCK - 1) / BASC_WARPS_PER_BLOCK);
+        frontier_mark_neighbors_kernel<<<blocks, 256>>>(
+            count, thrust::raw_pointer_cast(source.data()),
+            thrust::raw_pointer_cast(graph.offsets.data()),
+            thrust::raw_pointer_cast(graph.neighbors.data()),
+            thrust::raw_pointer_cast(labels.data()), epoch,
+            thrust::raw_pointer_cast(active_epoch.data()),
+            thrust::raw_pointer_cast(destination.data()),
+            thrust::raw_pointer_cast(list_counter.data()));
+        CUDA_CHECK(cudaGetLastError());
+    };
+    auto read_list_count = [&]() {
+        unsigned long long count = 0;
+        CUDA_CHECK(cudaMemcpy(&count, thrust::raw_pointer_cast(list_counter.data()),
+                              sizeof(count), cudaMemcpyDeviceToHost));
+        return static_cast<std::int64_t>(count);
+    };
+    CUDA_CHECK(cudaMemset(thrust::raw_pointer_cast(list_counter.data()), 0,
+                          sizeof(unsigned long long)));
+    mark_neighbors(frontier_count, frontier, active);
+    std::int64_t active_count = read_list_count();
+
+    const auto growth_start = std::chrono::steady_clock::now();
+    int stalled_rounds = 0;
+    int rounds_since_emergency = 0;
+    auto create_emergency_seeds = [&]() -> std::int64_t {
+        frontier_emergency_mark_kernel<<<warp_blocks, 256>>>(
+            n, thrust::raw_pointer_cast(graph.offsets.data()),
+            thrust::raw_pointer_cast(graph.neighbors.data()),
+            thrust::raw_pointer_cast(emergency_priority.data()),
+            thrust::raw_pointer_cast(labels.data()),
+            thrust::raw_pointer_cast(emergency_flags.data()));
+        CUDA_CHECK(cudaGetLastError());
+        thrust::exclusive_scan(
+            emergency_flags.begin(), emergency_flags.end(),
+            emergency_positions.begin());
+        std::int32_t last_position = 0;
+        std::int32_t last_flag = 0;
+        CUDA_CHECK(cudaMemcpy(&last_position,
+            thrust::raw_pointer_cast(emergency_positions.data()) + (n - 1),
+            sizeof(last_position), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&last_flag,
+            thrust::raw_pointer_cast(emergency_flags.data()) + (n - 1),
+            sizeof(last_flag), cudaMemcpyDeviceToHost));
+        const auto count = static_cast<std::int64_t>(last_position + last_flag);
+        if (count <= 0) return 0;
+        frontier_compact_flags_kernel<<<vertex_blocks, 256>>>(
+            n, thrust::raw_pointer_cast(emergency_flags.data()),
+            thrust::raw_pointer_cast(emergency_positions.data()),
+            thrust::raw_pointer_cast(frontier.data()));
+        CUDA_CHECK(cudaGetLastError());
+        const int blocks = static_cast<int>((count + 255) / 256);
+        frontier_initialize_seeds_kernel<<<blocks, 256>>>(
+            count, thrust::raw_pointer_cast(frontier.data()),
+            thrust::raw_pointer_cast(graph.vertex_weights.data()),
+            thrust::raw_pointer_cast(labels.data()),
+            thrust::raw_pointer_cast(seed_mask.data()),
+            thrust::raw_pointer_cast(cluster_weights.data()));
+        CUDA_CHECK(cudaGetLastError());
+        stats.emergency_seeds += static_cast<std::uint64_t>(count);
+        assigned += static_cast<std::uint64_t>(count);
+        return count;
+    };
+
+    while (assigned < static_cast<std::uint64_t>(n)) {
+        // A capacity-saturated label can keep a very thin frontier alive for
+        // hundreds of hops.  Re-seed the remaining induced graph after a
+        // bounded wave so work stays close to O(V+E) in practice.
+        if (active_count == 0 || rounds_since_emergency >= 64) {
+            frontier_count = create_emergency_seeds();
+            if (frontier_count <= 0) {
+                throw std::runtime_error("frontier growth left unreachable vertices");
+            }
+            CUDA_CHECK(cudaMemset(thrust::raw_pointer_cast(list_counter.data()), 0,
+                                  sizeof(unsigned long long)));
+            ++epoch;
+            mark_neighbors(frontier_count, frontier, active);
+            active_count = read_list_count();
+            stalled_rounds = 0;
+            rounds_since_emergency = 0;
+            continue;
+        }
+
+        ++stats.growth_rounds;
+        ++rounds_since_emergency;
+        CUDA_CHECK(cudaMemset(thrust::raw_pointer_cast(proposal_counters.data()), 0,
+                              2 * sizeof(unsigned long long)));
+        const int active_warp_blocks = static_cast<int>(
+            (active_count + BASC_WARPS_PER_BLOCK - 1) / BASC_WARPS_PER_BLOCK);
+        frontier_growth_propose_kernel<<<active_warp_blocks, 256>>>(
+            active_count, thrust::raw_pointer_cast(active.data()),
+            thrust::raw_pointer_cast(graph.offsets.data()),
+            thrust::raw_pointer_cast(graph.neighbors.data()),
+            thrust::raw_pointer_cast(graph.edge_weights.data()),
+            thrust::raw_pointer_cast(graph.vertex_weights.data()),
+            thrust::raw_pointer_cast(labels.data()),
+            thrust::raw_pointer_cast(cluster_weights.data()), stats.cluster_cap,
+            confidence_threshold, max_postpone,
+            thrust::raw_pointer_cast(postpone.data()),
+            thrust::raw_pointer_cast(proposals.data()),
+            thrust::raw_pointer_cast(proposal_scores.data()),
+            thrust::raw_pointer_cast(proposal_counters.data()),
+            thrust::raw_pointer_cast(proposal_counters.data()) + 1);
+        CUDA_CHECK(cudaGetLastError());
+        unsigned long long round_proposed = 0;
+        unsigned long long round_postponed = 0;
+        CUDA_CHECK(cudaMemcpy(&round_proposed,
+            thrust::raw_pointer_cast(proposal_counters.data()),
+            sizeof(round_proposed), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&round_postponed,
+            thrust::raw_pointer_cast(proposal_counters.data()) + 1,
+            sizeof(round_postponed), cudaMemcpyDeviceToHost));
+        stats.proposed += round_proposed;
+        stats.postponed += round_postponed;
+
+        thrust::copy_n(active.begin(), active_count, order.begin());
+        thrust::sort(
+            thrust::device, order.begin(), order.begin() + active_count,
+            FrontierProposalOrder{
+                thrust::raw_pointer_cast(proposals.data()),
+                thrust::raw_pointer_cast(proposal_scores.data())});
+        const auto valid_count = static_cast<std::int64_t>(thrust::count_if(
+            thrust::device, order.begin(), order.begin() + active_count,
+            FrontierHasProposal{thrust::raw_pointer_cast(proposals.data())}));
+        std::int64_t accepted_count = 0;
+        unsigned long long round_rejected = 0;
+        if (valid_count > 0) {
+            const int blocks = static_cast<int>((valid_count + 255) / 256);
+            frontier_ordered_proposal_data_kernel<<<blocks, 256>>>(
+                valid_count, thrust::raw_pointer_cast(order.data()),
+                thrust::raw_pointer_cast(proposals.data()),
+                thrust::raw_pointer_cast(graph.vertex_weights.data()),
+                thrust::raw_pointer_cast(ordered_targets.data()),
+                thrust::raw_pointer_cast(ordered_weights.data()));
+            CUDA_CHECK(cudaGetLastError());
+            thrust::inclusive_scan_by_key(
+                thrust::device, ordered_targets.begin(),
+                ordered_targets.begin() + valid_count, ordered_weights.begin(),
+                prefix_weights.begin());
+            thrust::copy(
+                cluster_weights.begin(), cluster_weights.end(),
+                base_cluster_weights.begin());
+            CUDA_CHECK(cudaMemset(thrust::raw_pointer_cast(commit_counters.data()), 0,
+                                  2 * sizeof(unsigned long long)));
+            frontier_commit_prefix_kernel<<<blocks, 256>>>(
+                valid_count, thrust::raw_pointer_cast(order.data()),
+                thrust::raw_pointer_cast(ordered_targets.data()),
+                thrust::raw_pointer_cast(ordered_weights.data()),
+                thrust::raw_pointer_cast(prefix_weights.data()),
+                thrust::raw_pointer_cast(base_cluster_weights.data()),
+                stats.cluster_cap, thrust::raw_pointer_cast(labels.data()),
+                thrust::raw_pointer_cast(cluster_weights.data()),
+                thrust::raw_pointer_cast(accepted_frontier.data()),
+                thrust::raw_pointer_cast(commit_counters.data()),
+                thrust::raw_pointer_cast(commit_counters.data()) + 1);
+            CUDA_CHECK(cudaGetLastError());
+            unsigned long long host_accepted = 0;
+            CUDA_CHECK(cudaMemcpy(&host_accepted,
+                thrust::raw_pointer_cast(commit_counters.data()),
+                sizeof(host_accepted), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(&round_rejected,
+                thrust::raw_pointer_cast(commit_counters.data()) + 1,
+                sizeof(round_rejected), cudaMemcpyDeviceToHost));
+            accepted_count = static_cast<std::int64_t>(host_accepted);
+        }
+        stats.accepted += static_cast<std::uint64_t>(accepted_count);
+        stats.capacity_rejected += round_rejected;
+        assigned += static_cast<std::uint64_t>(accepted_count);
+
+        CUDA_CHECK(cudaMemset(thrust::raw_pointer_cast(list_counter.data()), 0,
+                              sizeof(unsigned long long)));
+        ++epoch;
+        const int active_blocks = static_cast<int>((active_count + 255) / 256);
+        frontier_carry_unassigned_kernel<<<active_blocks, 256>>>(
+            active_count, thrust::raw_pointer_cast(active.data()),
+            thrust::raw_pointer_cast(labels.data()), epoch,
+            thrust::raw_pointer_cast(active_epoch.data()),
+            thrust::raw_pointer_cast(next_active.data()),
+            thrust::raw_pointer_cast(list_counter.data()));
+        CUDA_CHECK(cudaGetLastError());
+        if (accepted_count > 0) {
+            mark_neighbors(accepted_count, accepted_frontier, next_active);
+        }
+        auto next_count = read_list_count();
+        if (diagnostics) {
+            std::cout << "ml_gpu_frontier_round level=" << level
+                      << " round=" << stats.growth_rounds
+                      << " active=" << active_count
+                      << " proposed=" << round_proposed
+                      << " postponed=" << round_postponed
+                      << " accepted=" << accepted_count
+                      << " capacity_rejected=" << round_rejected
+                      << " assigned=" << assigned << '\n';
+        }
+        if (accepted_count == 0) {
+            ++stalled_rounds;
+            if (round_postponed == 0 &&
+                (round_proposed == 0 || stalled_rounds >= 2)) {
+                frontier_count = create_emergency_seeds();
+                if (frontier_count <= 0) {
+                    throw std::runtime_error("frontier growth stalled without an emergency seed");
+                }
+                CUDA_CHECK(cudaMemset(thrust::raw_pointer_cast(list_counter.data()), 0,
+                                      sizeof(unsigned long long)));
+                ++epoch;
+                mark_neighbors(frontier_count, frontier, active);
+                active_count = read_list_count();
+                stalled_rounds = 0;
+                rounds_since_emergency = 0;
+                continue;
+            }
+        } else {
+            stalled_rounds = 0;
+        }
+        active.swap(next_active);
+        active_count = next_count;
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    stats.growth_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - growth_start).count();
+
+    const auto boundary_start = std::chrono::steady_clock::now();
+    thrust::device_vector<std::uint64_t> boundary_gains(static_cast<std::size_t>(n));
+    thrust::device_vector<std::uint8_t> boundary_winners(static_cast<std::size_t>(n));
+    thrust::device_vector<unsigned long long> boundary_counters(2, 0ULL);
+    thrust::device_vector<unsigned long long> cut_counter(1, 0ULL);
+    auto device_label_cut = [&]() {
+        CUDA_CHECK(cudaMemset(thrust::raw_pointer_cast(cut_counter.data()), 0,
+                              sizeof(unsigned long long)));
+        weighted_cut_kernel<<<vertex_blocks, 256>>>(
+            n, thrust::raw_pointer_cast(graph.offsets.data()),
+            thrust::raw_pointer_cast(graph.neighbors.data()),
+            thrust::raw_pointer_cast(graph.edge_weights.data()),
+            thrust::raw_pointer_cast(labels.data()),
+            thrust::raw_pointer_cast(cut_counter.data()));
+        CUDA_CHECK(cudaGetLastError());
+        unsigned long long directed = 0;
+        CUDA_CHECK(cudaMemcpy(&directed,
+            thrust::raw_pointer_cast(cut_counter.data()), sizeof(directed),
+            cudaMemcpyDeviceToHost));
+        if (directed & 1ULL) {
+            throw std::runtime_error("frontier boundary cut is not symmetric");
+        }
+        return static_cast<std::uint64_t>(directed / 2);
+    };
+    for (int boundary_round = 0; boundary_round < 2; ++boundary_round) {
+        const auto cut_before = diagnostics ? device_label_cut() : 0;
+        frontier_boundary_propose_kernel<<<warp_blocks, 256>>>(
+            n, thrust::raw_pointer_cast(graph.offsets.data()),
+            thrust::raw_pointer_cast(graph.neighbors.data()),
+            thrust::raw_pointer_cast(graph.edge_weights.data()),
+            thrust::raw_pointer_cast(graph.vertex_weights.data()),
+            thrust::raw_pointer_cast(labels.data()),
+            thrust::raw_pointer_cast(seed_mask.data()),
+            thrust::raw_pointer_cast(cluster_weights.data()), stats.cluster_cap,
+            thrust::raw_pointer_cast(proposals.data()),
+            thrust::raw_pointer_cast(proposal_scores.data()),
+            thrust::raw_pointer_cast(boundary_gains.data()));
+        CUDA_CHECK(cudaGetLastError());
+        // The top-K support table chooses a bounded target candidate.  Re-scan
+        // that one target exactly before conflict selection: on coarse graphs a
+        // vertex can touch more than K labels, so the bounded table is not an
+        // exact gain accumulator.
+        frontier_boundary_exact_gain_kernel<<<warp_blocks, 256>>>(
+            n, thrust::raw_pointer_cast(graph.offsets.data()),
+            thrust::raw_pointer_cast(graph.neighbors.data()),
+            thrust::raw_pointer_cast(graph.edge_weights.data()),
+            thrust::raw_pointer_cast(labels.data()),
+            thrust::raw_pointer_cast(proposals.data()),
+            thrust::raw_pointer_cast(proposal_scores.data()),
+            thrust::raw_pointer_cast(boundary_gains.data()));
+        CUDA_CHECK(cudaGetLastError());
+        frontier_boundary_conflict_kernel<<<warp_blocks, 256>>>(
+            n, thrust::raw_pointer_cast(graph.offsets.data()),
+            thrust::raw_pointer_cast(graph.neighbors.data()),
+            thrust::raw_pointer_cast(proposals.data()),
+            thrust::raw_pointer_cast(boundary_gains.data()),
+            thrust::raw_pointer_cast(boundary_winners.data()));
+        CUDA_CHECK(cudaGetLastError());
+        frontier_apply_boundary_conflicts_kernel<<<vertex_blocks, 256>>>(
+            n, thrust::raw_pointer_cast(boundary_winners.data()),
+            thrust::raw_pointer_cast(proposals.data()));
+        CUDA_CHECK(cudaGetLastError());
+
+        thrust::sequence(order.begin(), order.end());
+        thrust::sort(
+            thrust::device, order.begin(), order.end(),
+            FrontierProposalOrder{
+                thrust::raw_pointer_cast(proposals.data()),
+                thrust::raw_pointer_cast(proposal_scores.data())});
+        const auto valid_count = static_cast<std::int64_t>(thrust::count_if(
+            thrust::device, order.begin(), order.end(),
+            FrontierHasProposal{thrust::raw_pointer_cast(proposals.data())}));
+        if (valid_count == 0) break;
+        const int blocks = static_cast<int>((valid_count + 255) / 256);
+        frontier_ordered_proposal_data_kernel<<<blocks, 256>>>(
+            valid_count, thrust::raw_pointer_cast(order.data()),
+            thrust::raw_pointer_cast(proposals.data()),
+            thrust::raw_pointer_cast(graph.vertex_weights.data()),
+            thrust::raw_pointer_cast(ordered_targets.data()),
+            thrust::raw_pointer_cast(ordered_weights.data()));
+        CUDA_CHECK(cudaGetLastError());
+        thrust::inclusive_scan_by_key(
+            thrust::device, ordered_targets.begin(),
+            ordered_targets.begin() + valid_count, ordered_weights.begin(),
+            prefix_weights.begin());
+        thrust::copy(cluster_weights.begin(), cluster_weights.end(),
+                     base_cluster_weights.begin());
+        CUDA_CHECK(cudaMemset(thrust::raw_pointer_cast(boundary_counters.data()), 0,
+                              2 * sizeof(unsigned long long)));
+        frontier_boundary_commit_kernel<<<blocks, 256>>>(
+            valid_count, thrust::raw_pointer_cast(order.data()),
+            thrust::raw_pointer_cast(ordered_targets.data()),
+            thrust::raw_pointer_cast(ordered_weights.data()),
+            thrust::raw_pointer_cast(prefix_weights.data()),
+            thrust::raw_pointer_cast(base_cluster_weights.data()),
+            stats.cluster_cap, thrust::raw_pointer_cast(boundary_gains.data()),
+            thrust::raw_pointer_cast(labels.data()),
+            thrust::raw_pointer_cast(cluster_weights.data()),
+            thrust::raw_pointer_cast(boundary_counters.data()),
+            thrust::raw_pointer_cast(boundary_counters.data()) + 1);
+        CUDA_CHECK(cudaGetLastError());
+        unsigned long long moved = 0;
+        unsigned long long gain = 0;
+        CUDA_CHECK(cudaMemcpy(&moved,
+            thrust::raw_pointer_cast(boundary_counters.data()), sizeof(moved),
+            cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&gain,
+            thrust::raw_pointer_cast(boundary_counters.data()) + 1, sizeof(gain),
+            cudaMemcpyDeviceToHost));
+        ++stats.boundary_rounds;
+        stats.boundary_moved += moved;
+        stats.boundary_gain += gain;
+        if (diagnostics) {
+            const auto cut_after = device_label_cut();
+            if (cut_after > cut_before || cut_before - cut_after != gain) {
+                throw std::runtime_error(
+                    "frontier boundary gain does not match full cut recomputation");
+            }
+            std::cout << "ml_gpu_frontier_boundary level=" << level
+                      << " round=" << boundary_round
+                      << " proposed_nonconflicting=" << valid_count
+                      << " moved=" << moved
+                      << " gain=" << gain
+                      << " cut_before=" << cut_before
+                      << " cut_after=" << cut_after << '\n';
+        }
+        if (moved == 0) break;
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    stats.boundary_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - boundary_start).count();
+
+    thrust::device_vector<std::int32_t> root_flags(static_cast<std::size_t>(n));
+    thrust::device_vector<std::int32_t> root_ids(static_cast<std::size_t>(n));
+    frontier_mark_label_roots_kernel<<<vertex_blocks, 256>>>(
+        n, thrust::raw_pointer_cast(labels.data()),
+        thrust::raw_pointer_cast(root_flags.data()));
+    CUDA_CHECK(cudaGetLastError());
+    thrust::exclusive_scan(root_flags.begin(), root_flags.end(), root_ids.begin());
+    std::int32_t last_root_id = 0;
+    std::int32_t last_root_flag = 0;
+    CUDA_CHECK(cudaMemcpy(&last_root_id,
+        thrust::raw_pointer_cast(root_ids.data()) + (n - 1),
+        sizeof(last_root_id), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&last_root_flag,
+        thrust::raw_pointer_cast(root_flags.data()) + (n - 1),
+        sizeof(last_root_flag), cudaMemcpyDeviceToHost));
+
+    DeviceAggregateResult out;
+    out.coarse_vertices = last_root_id + last_root_flag;
+    out.capacity = stats.cluster_cap;
+    if (out.coarse_vertices <= 0 ||
+        out.coarse_vertices != stats.target_clusters +
+            static_cast<std::int64_t>(stats.emergency_seeds)) {
+        throw std::runtime_error("frontier coarsening root count mismatch");
+    }
+    out.map.resize(static_cast<std::size_t>(n));
+    frontier_compact_labels_kernel<<<vertex_blocks, 256>>>(
+        n, thrust::raw_pointer_cast(labels.data()),
+        thrust::raw_pointer_cast(root_ids.data()),
+        thrust::raw_pointer_cast(out.map.data()));
+    CUDA_CHECK(cudaGetLastError());
+    out.vertex_weights.resize(static_cast<std::size_t>(out.coarse_vertices));
+    thrust::fill(out.vertex_weights.begin(), out.vertex_weights.end(), std::uint64_t{0});
+    basc_coarse_vertex_weights_kernel<<<vertex_blocks, 256>>>(
+        n, thrust::raw_pointer_cast(graph.vertex_weights.data()),
+        thrust::raw_pointer_cast(out.map.data()),
+        thrust::raw_pointer_cast(out.vertex_weights.data()));
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    out.maximum_weight = thrust::reduce(
+        out.vertex_weights.begin(), out.vertex_weights.end(),
+        std::uint64_t{0}, thrust::maximum<std::uint64_t>());
+    if (out.maximum_weight > stats.cluster_cap) {
+        throw std::runtime_error("frontier coarsening exceeded cluster capacity");
+    }
+    std::cout << "ml_gpu_frontier level=" << level
+              << " target_clusters=" << stats.target_clusters
+              << " coarse_vertices=" << out.coarse_vertices
+              << " hot_seeds=" << stats.hot_seeds
+              << " cold_seeds=" << stats.cold_seeds
+              << " cold_seed_rounds=" << stats.cold_seed_rounds
+              << " emergency_seeds=" << stats.emergency_seeds
+              << " cluster_cap=" << stats.cluster_cap
+              << " capacity_slack=" << capacity_slack
+              << " contraction_factor=" << contraction_factor
+              << " hot_ratio=" << hot_ratio
+              << " growth_rounds=" << stats.growth_rounds
+              << " proposed=" << stats.proposed
+              << " postponed=" << stats.postponed
+              << " accepted=" << stats.accepted
+              << " capacity_rejected=" << stats.capacity_rejected
+              << " seed_seconds=" << stats.seed_seconds
+              << " growth_seconds=" << stats.growth_seconds
+              << " boundary_rounds=" << stats.boundary_rounds
+              << " boundary_moved=" << stats.boundary_moved
+              << " boundary_gain=" << stats.boundary_gain
+              << " boundary_seconds=" << stats.boundary_seconds << '\n';
+    return out;
+}
+
 DeviceWeightedGraph gpu_contract_graph(
     const DeviceWeightedGraph& fine, const DeviceAggregateResult& aggregate,
     double& seconds) {
@@ -2105,13 +3346,21 @@ WeightedGraph make_weighted(const CSRGraph& graph) {
     return out;
 }
 
-void run_basc_gpu_hierarchy(
+void run_device_hierarchy(
     const CSRGraph& input, int parts, double ratio, std::uint32_t seed,
     double stop_contraction_ratio, int basc_k, int max_levels,
-    const std::string& output_path, bool strict_verify) {
+    const std::string& method, const std::string& output_path,
+    bool strict_verify) {
     const auto total_start = std::chrono::steady_clock::now();
-    const bool diagnostics = std::getenv("BASC_DIAGNOSTICS") != nullptr;
-    const bool verify = strict_verify || std::getenv("BASC_GPU_VERIFY") != nullptr;
+    const bool frontier_method = method == "frontier";
+    const bool diagnostics = frontier_method
+        ? std::getenv("FRONTIER_DIAGNOSTICS") != nullptr
+        : std::getenv("BASC_DIAGNOSTICS") != nullptr;
+    const bool verify = strict_verify ||
+        (frontier_method
+             ? std::getenv("FRONTIER_VERIFY") != nullptr
+             : std::getenv("BASC_GPU_VERIFY") != nullptr);
+    const bool skip_export = std::getenv("ML_SKIP_HIERARCHY_EXPORT") != nullptr;
     std::vector<WeightedGraph> levels;
     std::vector<std::vector<std::int32_t>> maps;
     levels.push_back(make_weighted(input));
@@ -2139,7 +3388,8 @@ void run_basc_gpu_hierarchy(
     CUDA_CHECK(cudaDeviceSynchronize());
     const auto device_input_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - device_input_start).count();
-    std::cout << "ml_gpu_basc_device_input_seconds=" << device_input_seconds << '\n';
+    std::cout << "ml_gpu_device_input_seconds=" << device_input_seconds
+              << " method=" << method << '\n';
 
     const std::int64_t cutoff = std::max<std::int64_t>(32, parts * 8);
     const auto core_start = std::chrono::steady_clock::now();
@@ -2150,12 +3400,20 @@ void run_basc_gpu_hierarchy(
         std::cout << "ml_coarsen_begin level=" << level
                   << " vertices=" << current.vertices()
                   << " edges=" << current.edges()
-                  << " method=basc_gpu"
+                  << " method=" << method
                   << " seed=" << (seed + static_cast<std::uint32_t>(level)) << '\n';
-        BascStats stats;
-        auto aggregate = gpu_basc_aggregate_device(
-            current, parts, basc_k,
-            seed + static_cast<std::uint32_t>(level), level, stats, diagnostics);
+        DeviceAggregateResult aggregate;
+        if (frontier_method) {
+            FrontierStats stats;
+            aggregate = gpu_frontier_aggregate_device(
+                current, parts, seed + static_cast<std::uint32_t>(level),
+                level, stats, diagnostics);
+        } else {
+            BascStats stats;
+            aggregate = gpu_basc_aggregate_device(
+                current, parts, basc_k,
+                seed + static_cast<std::uint32_t>(level), level, stats, diagnostics);
+        }
         const double contraction = static_cast<double>(aggregate.coarse_vertices) /
                                    static_cast<double>(current.vertices());
         std::cout << "ml_coarsen_map level=" << level
@@ -2183,7 +3441,7 @@ void run_basc_gpu_hierarchy(
         const auto snapshot = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - snapshot_start).count();
         snapshot_seconds += snapshot;
-        std::cout << "ml_gpu_basc_snapshot_seconds level=" << level
+        std::cout << "ml_gpu_device_snapshot_seconds level=" << level
                   << " seconds=" << snapshot << '\n';
 
         if (verify) {
@@ -2191,7 +3449,7 @@ void run_basc_gpu_hierarchy(
             validate_coarsening_step(
                 levels.back(), coarse_host, host_map, aggregate.capacity,
                 level, strict_verify);
-            std::cout << "ml_gpu_basc_verify_seconds level=" << level
+            std::cout << "ml_gpu_device_verify_seconds level=" << level
                       << " seconds=" << std::chrono::duration<double>(
                              std::chrono::steady_clock::now() - verify_start).count()
                       << '\n';
@@ -2205,26 +3463,28 @@ void run_basc_gpu_hierarchy(
     }
     const auto core_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - core_start).count();
-    std::cout << "ml_gpu_basc_core_seconds=" << core_seconds
-              << " aggregate_plus_contract=1\n";
+    std::cout << "ml_gpu_device_core_seconds=" << core_seconds
+              << " aggregate_plus_contract=1 method=" << method << '\n';
 
     const auto export_start = std::chrono::steady_clock::now();
-    write_jet_hierarchy(levels, maps, output_path);
+    if (!skip_export) write_jet_hierarchy(levels, maps, output_path);
     const auto export_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - export_start).count();
-    std::cout << "ml_hierarchy_export_seconds=" << export_seconds << '\n';
+    std::cout << "ml_hierarchy_export_seconds=" << export_seconds
+              << " skipped=" << (skip_export ? 1 : 0) << '\n';
     std::cout << "ml_hierarchy_levels=" << levels.size()
               << " coarsest_vertices=" << levels.back().vertices()
               << " stop_reason=" << stop_reason
               << " stop_contraction_ratio=" << stop_contraction_ratio
-              << " method=basc_gpu"
+              << " method=" << method
               << " basc_k=" << basc_k << '\n';
-    std::cout << "ml_gpu_basc_snapshot_total_seconds=" << snapshot_seconds << '\n';
+    std::cout << "ml_gpu_device_snapshot_total_seconds=" << snapshot_seconds
+              << " method=" << method << '\n';
     std::cout << "ml_total_seconds="
               << std::chrono::duration<double>(
                      std::chrono::steady_clock::now() - total_start).count()
-              << " hierarchy=" << output_path
-              << " coarsen_only=1 method=basc_gpu"
+              << " hierarchy=" << (skip_export ? "skipped" : output_path)
+              << " coarsen_only=1 method=" << method
               << " basc_k=" << basc_k << '\n';
 }
 
@@ -2236,7 +3496,7 @@ int main(int argc, char** argv) {
             std::cerr << "Usage: " << argv[0]
                       << " <indptr.bin> <indices.bin> <parts> <hierarchy.out>"
                       << " [max_vertex_ratio] [seed] [stop_contraction_ratio]"
-                      << " [coarsen_method=lp|basc|basc_gpu] [basc_k=1|2|4]"
+                      << " [coarsen_method=lp|basc|basc_gpu|frontier] [basc_k=1|2|4]"
                       << " [max_levels]\n";
             return 2;
         }
@@ -2253,8 +3513,9 @@ int main(int argc, char** argv) {
             throw std::runtime_error("invalid parts or maximum vertex ratio");
         }
         if (coarsen_method != "lp" && coarsen_method != "basc" &&
-            coarsen_method != "basc_gpu") {
-            throw std::runtime_error("coarsen_method must be lp, basc, or basc_gpu");
+            coarsen_method != "basc_gpu" && coarsen_method != "frontier") {
+            throw std::runtime_error(
+                "coarsen_method must be lp, basc, basc_gpu, or frontier");
         }
         if (stop_contraction_ratio <= 0.0 || stop_contraction_ratio > 1.0) {
             throw std::runtime_error("invalid coarsening stop ratio");
@@ -2269,10 +3530,10 @@ int main(int argc, char** argv) {
         CSRGraph input;
         input.load(argv[1], argv[2]);
         const bool strict_verify = std::getenv("GPU_LP_STRICT_VERIFY") != nullptr;
-        if (coarsen_method == "basc_gpu") {
-            run_basc_gpu_hierarchy(
+        if (coarsen_method == "basc_gpu" || coarsen_method == "frontier") {
+            run_device_hierarchy(
                 input, parts, ratio, seed, stop_contraction_ratio,
-                basc_k, max_levels, argv[4], strict_verify);
+                basc_k, max_levels, coarsen_method, argv[4], strict_verify);
             return 0;
         }
         std::vector<WeightedGraph> levels;
