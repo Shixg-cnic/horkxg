@@ -280,11 +280,15 @@ void run_hierarchy(
                      std::chrono::steady_clock::now() - device_input_start).count()
               << " method=sclp\n";
 
-    const std::int64_t cutoff = std::max<std::int64_t>(32, parts * 8);
+    // With U=ceil(W/(beta*k)), capacity alone keeps the useful coarse scale
+    // near beta*k vertices; attempting to drive toward the old 8*k cutoff only
+    // produces saturated clusters and an insufficient-contraction stop.
+    const std::int64_t cutoff = std::max<std::int64_t>(
+        32, sclp::kBeta * static_cast<std::int64_t>(parts));
     const auto core_start = std::chrono::steady_clock::now();
     double device_algorithm_seconds = 0.0;
     double snapshot_seconds = 0.0;
-    std::string stop_reason = "vertex_cutoff";
+    std::string stop_reason = "capacity_floor";
     int level = 0;
     for (; level < max_levels && current.vertices() > cutoff; ++level) {
         std::cout << "ml_coarsen_begin level=" << level

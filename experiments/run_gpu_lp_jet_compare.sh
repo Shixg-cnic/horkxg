@@ -35,7 +35,7 @@ for dataset in "${DATASETS[@]}"; do
     indptr="${DATA_ROOT}/${dataset}/${dataset}_sym_indptr.bin"
     indices="${DATA_ROOT}/${dataset}/${dataset}_sym_indices.bin"
     metis="${METIS_ROOT}/${dataset}/${dataset}.metis"
-    method_tag="sclp_b256_r4_th0p60_second_best"
+    method_tag="sclp_b256_r4_th0p60_no_second_best"
     for k in "${PARTS_LIST[@]}"; do
         if [[ "$k" != "2" && "$k" != "4" && "$k" != "8" &&
               "$k" != "16" && "$k" != "32" ]]; then

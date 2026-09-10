@@ -7,6 +7,8 @@
 
 namespace sclp {
 
+inline constexpr std::int64_t kBeta = 256;
+
 struct WeightedGraph {
     std::vector<std::int64_t> offsets;
     std::vector<std::int32_t> neighbors;
@@ -47,10 +49,6 @@ struct SclpStats {
     std::uint64_t capacity = 0;
     std::uint64_t lp_accepted = 0;
     std::uint64_t capacity_rejected = 0;
-    std::uint64_t second_best_proposed = 0;
-    std::uint64_t second_best_accepted = 0;
-    std::uint64_t second_best_rejected = 0;
-    std::uint64_t second_best_gain = 0;
     std::uint64_t two_hop_merged = 0;
     std::uint64_t singleton_count = 0;
     std::uint64_t proposal_count = 0;
