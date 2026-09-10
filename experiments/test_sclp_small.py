@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small independent oracle for the GPU coarsening hierarchy exporter.
+"""Small independent oracle for the SCLP hierarchy exporter.
 
 The test creates a symmetric CSR with an isolated component, parallel edges,
 and self-loops, then checks every emitted level without importing the C++
@@ -23,7 +23,7 @@ def write_i64(path: Path, values: list[int]) -> None:
 
 
 def make_graph() -> tuple[list[int], list[int]]:
-    adjacency: list[list[int]] = [[] for _ in range(256)]
+    adjacency: list[list[int]] = [[] for _ in range(4096)]
     def add(u: int, v: int, copies: int = 1) -> None:
         for _ in range(copies):
             adjacency[u].append(v)
@@ -40,7 +40,7 @@ def make_graph() -> tuple[list[int], list[int]]:
     # An isolated vertex (7) and a separate pair (8, 9).
     add(8, 9)
     # The remainder is a collection of short chains, ensuring n > cutoff.
-    for u in range(10, 255, 2):
+    for u in range(10, 4095, 2):
         add(u, u + 1)
     offsets = [0]
     indices: list[int] = []
@@ -113,46 +113,37 @@ def check(path: Path, capacities: list[int]) -> None:
 
 def main() -> None:
     binary = Path(os.environ.get("MULTILEVEL_BIN", "build-gh200/multilevel_lp"))
-    method = os.environ.get("BASC_TEST_METHOD", "basc")
-    if method not in {"basc", "basc_gpu", "frontier", "sclp"}:
-        raise SystemExit("BASC_TEST_METHOD must be basc, basc_gpu, frontier, or sclp")
-    with tempfile.TemporaryDirectory(prefix="basc-small-") as tmp:
+    method = "sclp"
+    with tempfile.TemporaryDirectory(prefix="sclp-small-") as tmp:
         root = Path(tmp)
         offsets, indices = make_graph()
         write_i64(root / "indptr.bin", offsets)
         write_i64(root / "indices.bin", indices)
-        for k in (1, 2, 4):
-            out = root / f"basc-k{k}.hierarchy"
-            log = root / f"basc-k{k}.log"
+        for run in range(1):
+            out = root / "sclp.hierarchy"
+            log = root / "sclp.log"
             child_env = os.environ.copy()
-            # beta=64 intentionally gives capacity one on this 256-vertex
-            # fixture.  Use a smaller beta to exercise weighted admission and
-            # contraction; production defaults remain unchanged.
-            if method == "sclp":
-                child_env.setdefault("SCLP_BETA", "1")
-            stop_ratio = "1.0" if method == "sclp" else "0.85"
             subprocess.run(
                 [str(binary), str(root / "indptr.bin"), str(root / "indices.bin"),
-                 "4", str(out), "1.10", "0", stop_ratio, method, str(k)],
+                 "4", str(out), "1.10", "0", "1.0", method, "2"],
                 check=True, stdout=log.open("w"), stderr=subprocess.STDOUT,
                 env=child_env,
             )
             text = log.read_text()
             capacities = [int(x) for x in re.findall(
-                r"ml_gpu_(?:basc(?:_device)?|frontier|sclp) .*?cluster_cap=(\d+)", text)]
+                r"ml_gpu_sclp .*?cluster_cap=(\d+)", text)]
             try:
                 check(out, capacities)
             except Exception:
                 print(text, file=sys.stderr)
                 raise
             assert "projection_cut=ok" in text
-            if method == "sclp":
-                assert "predicted_gain=" in text and "mover_fraction=" in text
-                actual_gains = [int(x) for x in re.findall(r"actual_gain=(\d+)", text)]
-                assert actual_gains and all(gain >= 0 for gain in actual_gains)
-                ratios = [float(x) for x in re.findall(
-                    r"ml_gpu_sclp level=0 .*?contraction_ratio=([0-9.e+-]+)", text)]
-                assert ratios and 0.45 <= ratios[0] <= 0.60
+            assert "predicted_gain=" in text and "mover_fraction=" in text
+            actual_gains = [int(x) for x in re.findall(r"actual_gain=(\d+)", text)]
+            assert actual_gains and all(gain >= 0 for gain in actual_gains)
+            ratios = [float(x) for x in re.findall(
+                r"ml_gpu_sclp level=0 .*?contraction_ratio=([0-9.e+-]+)", text)]
+            assert ratios and 0.45 <= ratios[0] <= 0.60
     print(f"{method} small hierarchy, capacity, symmetry, coverage, and cut tests passed")
 
 

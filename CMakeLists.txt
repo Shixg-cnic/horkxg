@@ -13,7 +13,8 @@ set(CMAKE_CUDA_ARCHITECTURES 90 CACHE STRING "CUDA architectures")
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 
 add_executable(multilevel_lp
-    src/multilevel_lp.cu
+    src/main.cu
+    src/sclp.cu
     src/graph.cpp
 )
 

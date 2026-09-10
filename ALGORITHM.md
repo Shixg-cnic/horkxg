@@ -1,196 +1,33 @@
-# 多层次 GPU-LP 算法说明
+# SCLP GPU 粗化
 
-## 项目边界
+本目录只保留 SCLP 主线：`src/main.cu` 负责层次驱动、校验和 Jet hierarchy
+导出，`src/sclp.cu` 负责聚合、admission 和 GPU contraction，`src/graph.cpp`
+负责读取 64-bit CSR。
 
-本项目是单 GPU、多层次图粗化实验，不实现多层递归二分，也不调用 METIS、
-Jet 或 CPU 最小割来生成自研粗化层。Jet 只作为固定后半段对照：读取自研
-输出的完整加权层次，在最粗层初始化并执行原生 projection/refinement。
+参数固定为 `beta=256`、最多 `4` 轮、two-hop 触发阈值 `0.60`。这些值是
+编译期常量，不再读取环境变量，也不按数据集或 k 搜索参数。
 
-内部 `multilevel_lp` 维护：
+每轮从冻结的 cluster 快照计算精确 affinity。低度点由 warp `match_any`
+归并相同邻簇；中度点使用每 warp shared-memory hash；只有度数大于 256 的 hub
+把紧凑边集送入全局 radix sort/reduce。首选正 gain proposal 按
+`(target, -gain, -tie, vertex)` 组成 CUB 自定义 radix key，并在 valid proposal
+压紧后排序。容量拒绝的点可按同一快照尝试一次 second-best 正 gain receiver。
 
-- 64-bit CSR offset 和顶点权重；
-- 每层 `fine_to_coarse` 映射；
-- 加权粗 CSR，合并平行边并删除簇内自环；
-- 每层的顶点/边收缩比例、内部边比例、aggregate 分布和阶段耗时。
+contraction 先以 warp ballot 压紧跨簇边，只有 cross-edge entries 进入
+sort/reduce。所有 admission 仍使用按 target 的 segmented prefix sum，结果不依赖
+CUDA atomic 到达顺序。
 
-每层会检查映射范围与覆盖、簇重量守恒、容量上限、粗图双向边权一致性，
-并用随机粗标签验证投影前后的加权切边守恒。设置
-`GPU_LP_STRICT_VERIFY=1` 时，会额外逐边检查反向 CSR。
-
-## LP 粗化
-
-默认 `coarsen_method=lp`。每层从单点簇开始，在 GPU 上执行两轮容量约束的
-邻居标签聚合，然后在 host 上构造加权 CSR。当前 host contraction 是质量验证
-优先版本，尚未作为性能结论。
-
-## BASC 粗化
-
-`coarsen_method=basc` 提供 Bounded Anchor-Support Coarsening 研究路径：
-
-1. 基于确定性 priority 的局部最大值选 anchor；
-2. 为顶点保留 K 个 anchor 候选，支持 K=1/2/4；
-3. 用常数状态 support 近似邻域社区连接；
-4. 按 4 个置信度桶，以 64-bit atomicCAS 进行容量预留；
-5. 对未分配点做一轮 aggregate expansion；
-6. 剩余点退化为 singleton，再压缩 aggregate ID。
-
-第一版固定 alpha、gamma、lambda、beta、置信度桶数和 expansion 阈值，不按
-单个案例调参。BASC 目前是可选研究后端，不改变默认 LP 路径。
-
-### Device-resident GPU 路径
-
-`coarsen_method=basc_gpu` 是同一 BASC 规则的性能实现：当前层 CSR、顶点权重
-和 aggregate 映射留在 GPU 上跨层传递；anchor 选举、候选生成、support、同步
-expansion、根压缩和聚类重量累加使用 CUDA，粗图收缩使用 GPU key sort/reduce，
-并在 GPU 上生成粗 CSR。每个顶点的 CSR 扫描采用一个 warp，K 候选的 support
-匹配也逐槽检查，不再把 K>1 简化为只看第一个候选。
-
-为了交给 Jet importer，仍会在每层做一次 host snapshot 并最终导出完整层次；
-这部分不属于 GPU contraction 核心，日志分别记录
-`ml_gpu_basc_core_seconds`、`ml_gpu_basc_snapshot_total_seconds` 和
-`ml_hierarchy_export_seconds`。products/k=4/seed=0 的一次 smoke 显示核心约
-3--4 秒，而完整层次导出约 55--61 秒，当前端到端瓶颈是 Jet 层次快照/导出。
-
-当前 admission 使用 GPU atomicCAS 做容量预留，因此同一 seed 的运行尚未保证
-bitwise repeatability；kim2/k=4/seed=0 的三次测试产生了不同层数和 hierarchy
-SHA256。该事实由 `experiments/test_basc_repeatability.py --method basc_gpu`
-记录，不把 seed=0 当作确定性证明。后续若需要严格复现实验，应增加 GPU 分段
-前缀容量预留，而不是继续依赖 atomic 竞争顺序。
-
-## 目标引导多源前沿粗化
-
-`coarsen_method=frontier` 实现独立于 BASC 的 target-guided seeded frontier
-路径。每层目标粗点数为 `max(C_min, ceil(n/r))`，默认 `r=8`。算法先按确定性
-priority 选取约一半 degree-local-maximum 热种子，再从其一跳未覆盖区域选择冷
-种子。所有 seed 从单点簇出发，GPU warp 按当前前沿扫描 CSR，按真实邻接标签
-权重和剩余容量评分；低置信候选最多推迟两轮。
-
-同一轮 proposal 基于冻结标签快照生成。proposal 按目标簇、分数降序和顶点号
-排序，使用 segmented prefix sum 做确定性容量 admission，提交后才生成下一轮
-前沿。无法从已有簇到达的剩余区域以确定性的局部极大点产生 emergency seed，
-保证孤立点和断开分量终止。增长完成后执行两轮短边界 relabel；同轮迁移点采用
-非邻接局部竞争，并再次用分段前缀和控制目标容量，因此被接受迁移的收益可以相加。
-
-当前层图、映射、权重以及 sort/reduce contraction 全部驻留 GPU。每层 host
-snapshot 仅用于完整层次导出给 Jet；设置 `ML_SKIP_HIERARCHY_EXPORT=1` 可在性能
-诊断时跳过最终文件写入，但正式 Jet 对照不能使用该选项。关键配置为：
+构建与小图验证：
 
 ```bash
-FRONTIER_CONTRACTION_FACTOR=8   # r
-FRONTIER_CAPACITY_SLACK=0.20    # 簇容量松弛
-FRONTIER_HOT_RATIO=0.50         # 热种子比例
-FRONTIER_DIAGNOSTICS=1          # 逐轮计数和边界收益核验
-FRONTIER_VERIFY=1               # 每层完整结构检查
+cmake -S . -B build-gh200 -DCMAKE_BUILD_TYPE=Release
+cmake --build build-gh200 -j
+GPU_LP_STRICT_VERIFY=1 SCLP_DIAGNOSTICS=1 \
+  python3 experiments/test_sclp_small.py
 ```
 
-默认参数不按图名或 k 特化。相同 seed 的确定性来自稳定排序和分段前缀 admission，
-不依赖 CUDA atomic 的到达顺序。严格小图覆盖自环、平行边、孤立点、断开分量、
-非单位点权和投影切边守恒；边界阶段还会比较完整重算切边下降量与接受收益之和。
-
-该版本目前有一个明确限制：目标粗点数是规划目标，不是无条件保证。在幂律图中，
-冻结增长加局部簇容量会形成空间屏障，未分配区域需要 emergency seed，实际粗点数
-可能明显高于目标。products/k=4/seed=0 已观察到该现象；增大容量松弛虽减少紧急
-种子，但固定 Jet 后半段的最终切边变差，因此没有把探测参数改成默认值，也没有
-据此宣称质量改善。数值结果保存在 sibling `single_gpu_lp_baseline` 的实验报告和
-产物目录，本代码仓库不存放大型实验输出。
-
-## Size-constrained LP 粗化
-
-`coarsen_method=sclp` 是独立后端，不调用 BASC 或 frontier。每层从
-`cluster[v]=v` 开始，默认最多执行 4 轮：
-
-1. 按顶点度数分为 low/medium/high 三组；low 使用 thread-per-vertex（一个 warp
-   同时处理多个低度点），medium 使用 warp-per-vertex，high 使用 CTA-per-vertex；
-2. 三类 kernel 在 GPU 写出 `(vertex, neighbor_cluster)` 键，sort/reduce 得到精确
-   加权 affinity，不使用 top-K 近似；
-3. 精确计算当前 cluster affinity 与最佳 receiver affinity，仅当 raw gain
-   `best-current > 0` 且 source 是 mover 时提出迁移；
-4. cluster 的 mover/receiver 角色由 `hash(cluster,seed,level,round)` 确定，
-   receiver 在当前 batch 固定不动，禁止 reciprocal/cyclic receiver migration；
-5. affinity 平局使用 `hash(vertex,target,seed,level,round)`，不依赖最小 ID；
-6. proposal 按 `(target, -gain, -hash_tie, vertex)` 稳定排序，按 target 做 segmented
-   prefix sum，仅接受前缀点权不超过目标剩余容量的 proposal；
-7. acceptance 基于同一快照，一次同步提交。atomic 只累加已经确定的整数权重，
-   不参与 admission 决策，因此结果不依赖线程到达顺序。
-
-簇容量为
-`max(max_vertex_weight, ceil(total_vertex_weight / (SCLP_BETA * parts)))`，默认
-`SCLP_BETA=64`。每轮最多将当前非空 cluster 中足以接近原层 `0.5*n` 的一部分
-设为 mover，且 mover 比例不超过 50%；达到 `coarse_vertices <= 0.6*n` 后停止
-普通 LP。最多 4 轮后，只有自然收缩比例仍高于 `SCLP_TWO_HOP_THRESHOLD`
-（默认 `0.50`）时，才对拥有相同 one-hop favorite 的 singleton 按确定性顺序
-两两配对；每个 two-hop cluster 最多两个点，并用全局 merge budget 只补到约
-`0.5*n`。设置 `SCLP_TWO_HOP_THRESHOLD=off` 可完全关闭 fallback。该机制仅用于
-进度，不作为主力 aggressive contraction。
-
-cluster ID 随后在 GPU compact；点权累加和加权粗 CSR 继续复用 device-resident
-GPU contraction。可配置项只有：
+固定 Jet 后半段对照：
 
 ```bash
-SCLP_BETA=64
-SCLP_ROUNDS=4                 # 允许 2--4
-SCLP_TWO_HOP_THRESHOLD=0.50   # 取值 [0.50,1.00]，或 off
-SCLP_VERIFY=1                 # 每层容量、CSR、权重和投影切边检查
-SCLP_DIAGNOSTICS=1
+KS=4 SEED=0 experiments/run_gpu_lp_jet_compare.sh products com-LiveJournal
 ```
-
-每层汇总输出 `fine_vertices/coarse_vertices/contraction_ratio/lp_accepted/`
-`capacity_rejected/singleton/two_hop_merged`，以及 `positive_gain_vertices/`
-`role_blocked/role_blocked_gain/singleton_with_favorite/pairable_singletons`。
-点权分布输出 `weight_p50/p90/p99/max`、`weight_max_over_cap` 和容量拒绝比例。
-每轮另输出 proposal、接受、拒绝、当前 cluster 数、预测 gain 和调试模式下的
-完整重算实际 gain。seed 用于角色划分与 affinity tie-break；相同 seed 仍保证
-确定性，但不再有 smallest-ID 偏置。
-
-`ml_gpu_device_core_seconds` 只累计 SCLP aggregate 与 GPU contraction；包含 host
-snapshot 和验证的整个循环另记为 `ml_hierarchy_loop_seconds`，避免把 snapshot
-时间误称为纯 GPU core 时间。
-
-结构语义修正版已消除旧版本的大幅质量退化。进一步消融表明 two-hop 的效果
-有图依赖：阈值 `0.60` 相对 `0.50` 改善 products 且小幅改善 LiveJournal，完全
-关闭则改善 LiveJournal 但明显损害 products；因此没有加入数据集特定规则。
-固定 `threshold=0.60` 后，`beta=256` 的五 seed 对照中，SCLP+Jet 后半段平均仍
-略差于 Jet 原粗化（products 约 `+1.14%`，LiveJournal 约 `+0.36%`，正数表示
-切边更多），尚不构成稳定质量胜出。SCLP 仍是隔离实验后端；没有增加 degree
-penalty、confidence 或 hot/cold。完整数值和产物保存在 sibling
-`single_gpu_lp_baseline`。
-
-## 可复核实验
-
-小图正确性测试：
-
-```bash
-GPU_LP_STRICT_VERIFY=1 python3 experiments/test_basc_small.py
-```
-
-测试两条 BASC 路径：
-
-```bash
-GPU_LP_STRICT_VERIFY=1 BASC_TEST_METHOD=basc \
-  python3 experiments/test_basc_small.py
-GPU_LP_STRICT_VERIFY=1 BASC_TEST_METHOD=basc_gpu \
-  python3 experiments/test_basc_small.py
-GPU_LP_STRICT_VERIFY=1 FRONTIER_DIAGNOSTICS=1 BASC_TEST_METHOD=frontier \
-  python3 experiments/test_basc_small.py
-GPU_LP_STRICT_VERIFY=1 SCLP_VERIFY=1 BASC_TEST_METHOD=sclp \
-  python3 experiments/test_basc_small.py
-python3 experiments/test_basc_repeatability.py --method basc_gpu \
-  --indptr ../dataset/Gpartition_dataset/Sym_CSR/kim2/kim2_sym_indptr.bin \
-  --indices ../dataset/Gpartition_dataset/Sym_CSR/kim2/kim2_sym_indices.bin \
-  --parts 4 --seed 0 --basc-k 2
-```
-
-Jet 后半段对照和结果表：
-
-```bash
-METHOD=basc_gpu BASC_K=2 STOP_RATIO=0.90 MAX_LEVELS=24 \
-  experiments/run_gpu_lp_jet_compare.sh products com-LiveJournal
-METHOD=frontier FRONTIER_CONTRACTION_FACTOR=8 \
-  FRONTIER_CAPACITY_SLACK=0.20 FRONTIER_HOT_RATIO=0.50 \
-  experiments/run_gpu_lp_jet_compare.sh products
-KS=4 METHOD=sclp SCLP_BETA=64 SCLP_ROUNDS=4 \
-  SCLP_TWO_HOP_THRESHOLD=0.60 \
-  experiments/run_gpu_lp_jet_compare.sh products com-LiveJournal
-```
-
-完整结果和大型产物保存在 sibling `single_gpu_lp_baseline` 项目中。

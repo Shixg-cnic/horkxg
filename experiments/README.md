@@ -1,10 +1,9 @@
 # 实验工具
 
-- `test_basc_small.py`：生成带自环、平行边、孤立点和断开分量的小图，检查
-  BASC K=1/2/4 的层次合法性和随机投影切边守恒。
-- `verify_partition.py`：从原始 Symmetric CSR 独立重算无向切边、负载和容量。
-- `run_gpu_lp_jet_compare.sh`：运行 Jet 原版粗化 A，以及自研层次加 Jet 后半段 B。
-- `summarize_gpu_lp_jet.py`：汇总既有 LP 对照目录；BASC 消融的原始日志保留在
-  `build-gh200/experiments/results/`。
+- `test_sclp_small.py`：生成含自环、平行边、孤立点和断开分量的小图，独立检查
+  hierarchy 的容量、覆盖、对称性和投影切边守恒。
+- `test_sclp_repeatability.py`：同 seed 重复运行并比较 hierarchy SHA256。
+- `verify_partition.py`：从原始 symmetric CSR 独立复算最终 cut、负载和容量。
+- `run_gpu_lp_jet_compare.sh`：运行 Jet 原粗化与固定参数 SCLP + 同一 Jet 后半段。
 
-脚本假定本项目、`dataset` 和 `sotas` 是 `partition` 下的兄弟目录。
+固定参数是 `beta=256 / rounds=4 / two-hop=0.60`，脚本不提供参数搜索入口。
