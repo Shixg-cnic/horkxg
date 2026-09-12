@@ -3,7 +3,6 @@
 #include "sclp.hpp"
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -244,72 +243,6 @@ WeightedGraph make_weighted(const CSRGraph& graph) {
     return out;
 }
 
-#ifdef SCLP_MERGE_DIAGNOSTICS
-std::vector<std::int32_t> read_reference_partition(
-    const std::string& path, std::int64_t vertices, int parts) {
-    std::ifstream input(path);
-    if (!input) {
-        throw std::runtime_error("cannot open reference partition: " + path);
-    }
-    std::vector<std::int32_t> labels;
-    labels.reserve(static_cast<std::size_t>(vertices));
-    std::int64_t value = 0;
-    while (input >> value) {
-        if (value < 0 || value >= parts) {
-            throw std::runtime_error(
-                "reference partition contains an out-of-range label: " + path);
-        }
-        labels.push_back(static_cast<std::int32_t>(value));
-    }
-    if (labels.size() != static_cast<std::size_t>(vertices)) {
-        throw std::runtime_error(
-            "reference partition length does not match graph: " + path);
-    }
-    return labels;
-}
-
-sclp::MergeDiagnosticContext make_merge_diagnostics(
-    std::int64_t vertices, int parts) {
-    if (parts != sclp::kDiagnosticParts) {
-        throw std::runtime_error("merge diagnostics currently require k=4");
-    }
-    const char* prefix = std::getenv("SCLP_DIAG_PREFIX");
-    const char* jet_path = std::getenv("SCLP_DIAG_JET_PART");
-    const char* metis_path = std::getenv("SCLP_DIAG_METIS_PART");
-    if (prefix == nullptr || jet_path == nullptr || metis_path == nullptr) {
-        throw std::runtime_error(
-            "diagnostic binary requires SCLP_DIAG_PREFIX, "
-            "SCLP_DIAG_JET_PART, and SCLP_DIAG_METIS_PART");
-    }
-    sclp::MergeDiagnosticContext context;
-    context.output_prefix = prefix;
-    context.reference_names = {"jet", "metis"};
-    const std::array<std::string, 2> paths = {jet_path, metis_path};
-    for (int oracle = 0; oracle < 2; ++oracle) {
-        const auto labels = read_reference_partition(
-            paths[oracle], vertices, parts);
-        auto& histograms = context.vertex_histograms[oracle];
-        histograms.resize(static_cast<std::size_t>(vertices));
-        for (std::int64_t v = 0; v < vertices; ++v) {
-            histograms[static_cast<std::size_t>(v)][
-                labels[static_cast<std::size_t>(v)]] = 1;
-        }
-    }
-    std::ofstream records(
-        context.output_prefix + ".merges.bin",
-        std::ios::binary | std::ios::trunc);
-    std::ofstream levels(
-        context.output_prefix + ".levels.csv", std::ios::trunc);
-    if (!records || !levels) {
-        throw std::runtime_error("cannot initialize merge diagnostic outputs");
-    }
-    levels << "role_mode,level,fine_vertices,coarse_vertices,contraction_ratio,"
-              "accepted,oracle0,bad0,bad_ratio0,total_loss0,average_loss0,purity0,"
-              "oracle1,bad1,bad_ratio1,total_loss1,average_loss1,purity1\n";
-    return context;
-}
-#endif
-
 void run_hierarchy(
     const CSRGraph& input, int parts, std::uint32_t seed,
     double stop_contraction_ratio, int max_levels,
@@ -318,12 +251,11 @@ void run_hierarchy(
     const bool diagnostics = std::getenv("SCLP_DIAGNOSTICS") != nullptr;
     const bool verify = strict_verify || std::getenv("SCLP_VERIFY") != nullptr;
     const bool skip_export = std::getenv("ML_SKIP_HIERARCHY_EXPORT") != nullptr;
+    const auto host_graph_build_start = std::chrono::steady_clock::now();
     std::vector<WeightedGraph> levels{make_weighted(input)};
+    const auto host_graph_build_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - host_graph_build_start).count();
     std::vector<std::vector<std::int32_t>> maps;
-#ifdef SCLP_MERGE_DIAGNOSTICS
-    auto merge_diagnostics = make_merge_diagnostics(
-        input.vertices(), parts);
-#endif
 
     const auto input_verify_start = std::chrono::steady_clock::now();
     if (strict_verify) {
@@ -338,18 +270,18 @@ void run_hierarchy(
         }
         (void)host_cut(levels.front(), labels);
     }
-    std::cout << "ml_input_verify_seconds="
-              << std::chrono::duration<double>(
-                     std::chrono::steady_clock::now() - input_verify_start).count()
+    const auto input_verify_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - input_verify_start).count();
+    std::cout << "ml_input_verify_seconds=" << input_verify_seconds
               << " status=ok mode=" << (strict_verify ? "strict" : "fast") << '\n';
 
     const auto device_input_start = std::chrono::steady_clock::now();
     auto current = sclp::make_device_weighted(levels.front());
     sclp::SclpWorkspace workspace;
     CUDA_CHECK(cudaDeviceSynchronize());
-    std::cout << "ml_gpu_device_input_seconds="
-              << std::chrono::duration<double>(
-                     std::chrono::steady_clock::now() - device_input_start).count()
+    const auto device_input_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - device_input_start).count();
+    std::cout << "ml_gpu_device_input_seconds=" << device_input_seconds
               << " method=sclp\n";
 
     // With U=ceil(W/(beta*k)), capacity alone keeps the useful coarse scale
@@ -359,12 +291,20 @@ void run_hierarchy(
         32, sclp::kBeta * static_cast<std::int64_t>(parts));
     const auto core_start = std::chrono::steady_clock::now();
     double device_algorithm_seconds = 0.0;
+    double aggregate_wall_seconds = 0.0;
+    double contraction_wall_seconds = 0.0;
     double snapshot_seconds = 0.0;
+    double aggregate_gpu_seconds = 0.0;
     double affinity_gpu_seconds = 0.0;
     double admission_gpu_seconds = 0.0;
     double two_hop_gpu_seconds = 0.0;
     double compact_gpu_seconds = 0.0;
     double contraction_gpu_seconds = 0.0;
+    double contraction_compact_gpu_seconds = 0.0;
+    double contraction_sort_gpu_seconds = 0.0;
+    double contraction_reduce_gpu_seconds = 0.0;
+    double contraction_csr_gpu_seconds = 0.0;
+    double contraction_vertex_weight_gpu_seconds = 0.0;
     std::string stop_reason = "capacity_floor";
     int level = 0;
     for (; level < max_levels && current.vertices() > cutoff; ++level) {
@@ -377,19 +317,22 @@ void run_hierarchy(
         const auto aggregate_start = std::chrono::steady_clock::now();
         auto aggregate = sclp::aggregate(
             current, workspace, parts, seed + static_cast<std::uint32_t>(level),
-            level, stats, diagnostics
-#ifdef SCLP_MERGE_DIAGNOSTICS
-            , &merge_diagnostics
-#endif
-            );
-        device_algorithm_seconds += std::chrono::duration<double>(
+            level, stats, diagnostics);
+        const auto level_aggregate_wall = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - aggregate_start).count();
+        device_algorithm_seconds += level_aggregate_wall;
+        aggregate_wall_seconds += level_aggregate_wall;
         const double contraction = static_cast<double>(aggregate.coarse_vertices) /
                                    static_cast<double>(current.vertices());
         affinity_gpu_seconds += stats.affinity_seconds;
         admission_gpu_seconds += stats.admission_seconds;
         two_hop_gpu_seconds += stats.two_hop_seconds;
         compact_gpu_seconds += stats.compact_seconds;
+        aggregate_gpu_seconds += stats.aggregate_seconds;
+        const auto aggregate_other_seconds = std::max(
+            0.0, stats.aggregate_seconds - stats.affinity_seconds -
+            stats.admission_seconds - stats.two_hop_seconds -
+            stats.compact_seconds);
         std::cout << "ml_coarsen_map level=" << level
                   << " coarse_vertices=" << aggregate.coarse_vertices
                   << " ratio=" << contraction
@@ -402,25 +345,48 @@ void run_hierarchy(
                       << " admission_seconds=" << stats.admission_seconds
                       << " two_hop_seconds=" << stats.two_hop_seconds
                       << " compact_seconds=" << stats.compact_seconds
+                      << " aggregate_other_seconds=" << aggregate_other_seconds
+                      << " aggregate_total_seconds=" << stats.aggregate_seconds
                       << " contraction_seconds=0\n";
             std::cout << "ml_coarsen_stop reason=insufficient_contraction\n";
             stop_reason = "insufficient_contraction";
             break;
         }
 
-        double contract_seconds = 0.0;
+        sclp::ContractionTimings contract_timings;
+        const auto contract_wall_start = std::chrono::steady_clock::now();
         auto coarse_device = sclp::contract(
-            current, aggregate, workspace, contract_seconds);
-        device_algorithm_seconds += contract_seconds;
-        contraction_gpu_seconds += contract_seconds;
+            current, aggregate, workspace, contract_timings);
+        const auto level_contract_wall = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - contract_wall_start).count();
+        device_algorithm_seconds += level_contract_wall;
+        contraction_wall_seconds += level_contract_wall;
+        contraction_gpu_seconds += contract_timings.total_seconds;
+        contraction_compact_gpu_seconds += contract_timings.compact_seconds;
+        contraction_sort_gpu_seconds += contract_timings.sort_seconds;
+        contraction_reduce_gpu_seconds += contract_timings.reduce_seconds;
+        contraction_csr_gpu_seconds += contract_timings.csr_build_seconds;
+        contraction_vertex_weight_gpu_seconds +=
+            contract_timings.vertex_weight_seconds;
         std::cout << "ml_gpu_timing level=" << level
                   << " affinity_seconds=" << stats.affinity_seconds
                   << " admission_seconds=" << stats.admission_seconds
                   << " two_hop_seconds=" << stats.two_hop_seconds
                   << " compact_seconds=" << stats.compact_seconds
-                  << " contraction_seconds=" << contract_seconds << '\n';
+                  << " aggregate_other_seconds=" << aggregate_other_seconds
+                  << " aggregate_total_seconds=" << stats.aggregate_seconds
+                  << " contraction_seconds=" << contract_timings.total_seconds
+                  << '\n';
+        std::cout << "ml_gpu_contraction_timing level=" << level
+                  << " compact_seconds=" << contract_timings.compact_seconds
+                  << " sort_seconds=" << contract_timings.sort_seconds
+                  << " reduce_seconds=" << contract_timings.reduce_seconds
+                  << " csr_build_seconds=" << contract_timings.csr_build_seconds
+                  << " vertex_weight_seconds="
+                  << contract_timings.vertex_weight_seconds
+                  << " total_seconds=" << contract_timings.total_seconds << '\n';
         std::cout << "ml_gpu_contract_seconds level=" << level
-                  << " seconds=" << contract_seconds
+                  << " seconds=" << contract_timings.total_seconds
                   << " coarse_edges=" << coarse_device.edges() << '\n';
 
         const auto snapshot_start = std::chrono::steady_clock::now();
@@ -459,7 +425,27 @@ void run_hierarchy(
               << " admission_seconds=" << admission_gpu_seconds
               << " two_hop_seconds=" << two_hop_gpu_seconds
               << " compact_seconds=" << compact_gpu_seconds
+              << " aggregate_other_seconds=" << std::max(
+                     0.0, aggregate_gpu_seconds - affinity_gpu_seconds -
+                     admission_gpu_seconds - two_hop_gpu_seconds -
+                     compact_gpu_seconds)
+              << " aggregate_total_seconds=" << aggregate_gpu_seconds
               << " contraction_seconds=" << contraction_gpu_seconds << '\n';
+    std::cout << "ml_gpu_contraction_timing_total"
+              << " compact_seconds=" << contraction_compact_gpu_seconds
+              << " sort_seconds=" << contraction_sort_gpu_seconds
+              << " reduce_seconds=" << contraction_reduce_gpu_seconds
+              << " csr_build_seconds=" << contraction_csr_gpu_seconds
+              << " vertex_weight_seconds="
+              << contraction_vertex_weight_gpu_seconds
+              << " total_seconds=" << contraction_gpu_seconds << '\n';
+    std::cout << "ml_wall_timing_total"
+              << " host_graph_build_seconds=" << host_graph_build_seconds
+              << " input_verify_seconds=" << input_verify_seconds
+              << " device_input_seconds=" << device_input_seconds
+              << " aggregate_seconds=" << aggregate_wall_seconds
+              << " contraction_seconds=" << contraction_wall_seconds
+              << " snapshot_seconds=" << snapshot_seconds << '\n';
     std::cout << "ml_hierarchy_loop_seconds=" << core_seconds
               << " includes_snapshot_and_verify=1 method=sclp\n";
 
