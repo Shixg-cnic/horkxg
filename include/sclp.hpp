@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
+#include <memory>
+#include <string>
 #include <vector>
 
 #include <thrust/device_vector.h>
@@ -45,6 +48,19 @@ struct DeviceAggregateResult {
     std::uint64_t capacity = 0;
 };
 
+class SclpWorkspace {
+public:
+    SclpWorkspace();
+    ~SclpWorkspace();
+    SclpWorkspace(SclpWorkspace&&) noexcept;
+    SclpWorkspace& operator=(SclpWorkspace&&) noexcept;
+    SclpWorkspace(const SclpWorkspace&) = delete;
+    SclpWorkspace& operator=(const SclpWorkspace&) = delete;
+
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+};
+
 struct SclpStats {
     std::uint64_t capacity = 0;
     std::uint64_t lp_accepted = 0;
@@ -61,17 +77,34 @@ struct SclpStats {
     double affinity_seconds = 0.0;
     double admission_seconds = 0.0;
     double two_hop_seconds = 0.0;
+    double compact_seconds = 0.0;
 };
+
+#ifdef SCLP_MERGE_DIAGNOSTICS
+inline constexpr int kDiagnosticParts = 4;
+using ReferenceHistogram = std::array<std::uint64_t, kDiagnosticParts>;
+
+struct MergeDiagnosticContext {
+    std::array<std::vector<ReferenceHistogram>, 2> vertex_histograms;
+    std::array<std::string, 2> reference_names;
+    std::string output_prefix;
+};
+#endif
 
 DeviceWeightedGraph make_device_weighted(const WeightedGraph& graph);
 WeightedGraph copy_device_weighted(const DeviceWeightedGraph& graph);
 
 DeviceAggregateResult aggregate(
-    const DeviceWeightedGraph& graph, int parts, std::uint32_t seed,
-    int level, SclpStats& stats, bool diagnostics);
+    const DeviceWeightedGraph& graph, SclpWorkspace& workspace,
+    int parts, std::uint32_t seed,
+    int level, SclpStats& stats, bool diagnostics
+#ifdef SCLP_MERGE_DIAGNOSTICS
+    , MergeDiagnosticContext* merge_diagnostics
+#endif
+    );
 
 DeviceWeightedGraph contract(
     const DeviceWeightedGraph& fine, const DeviceAggregateResult& aggregate,
-    double& seconds);
+    SclpWorkspace& workspace, double& seconds);
 
 }  // namespace sclp

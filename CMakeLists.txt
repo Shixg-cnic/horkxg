@@ -18,15 +18,32 @@ add_executable(multilevel_lp
     src/graph.cpp
 )
 
-target_include_directories(multilevel_lp PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
+add_executable(sclp_diag_mr
+    src/main.cu
+    src/sclp.cu
+    src/graph.cpp
+)
+target_compile_definitions(sclp_diag_mr PRIVATE SCLP_MERGE_DIAGNOSTICS=1)
+
+add_executable(sclp_diag_priority
+    src/main.cu
+    src/sclp.cu
+    src/graph.cpp
+)
+target_compile_definitions(sclp_diag_priority PRIVATE
+    SCLP_MERGE_DIAGNOSTICS=1
+    SCLP_PRIORITY_ORIENTATION=1
 )
 
-target_compile_options(multilevel_lp PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native>
-    $<$<COMPILE_LANGUAGE:CUDA>:-O3;-Xcompiler=-march=native>
-)
-
-set_target_properties(multilevel_lp PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-)
+foreach(target multilevel_lp sclp_diag_mr sclp_diag_priority)
+    target_include_directories(${target} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_compile_options(${target} PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native>
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3;-Xcompiler=-march=native>
+    )
+    set_target_properties(${target} PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+    )
+endforeach()

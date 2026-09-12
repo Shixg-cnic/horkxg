@@ -113,6 +113,7 @@ def check(path: Path, capacities: list[int]) -> None:
 
 def main() -> None:
     binary = Path(os.environ.get("MULTILEVEL_BIN", "build-gh200/multilevel_lp"))
+    merge_diagnostics = os.environ.get("SCLP_TEST_MERGE_DIAGNOSTICS") is not None
     method = "sclp"
     with tempfile.TemporaryDirectory(prefix="sclp-small-") as tmp:
         root = Path(tmp)
@@ -123,6 +124,20 @@ def main() -> None:
             out = root / "sclp.hierarchy"
             log = root / "sclp.log"
             child_env = os.environ.copy()
+            child_env["GPU_LP_STRICT_VERIFY"] = "1"
+            child_env["SCLP_DIAGNOSTICS"] = "1"
+            if merge_diagnostics:
+                jet_part = root / "jet.part"
+                metis_part = root / "metis.part"
+                jet_part.write_text("".join(f"{v % 4}\n" for v in range(4096)))
+                metis_part.write_text(
+                    "".join(f"{(v // 3) % 4}\n" for v in range(4096))
+                )
+                child_env.update({
+                    "SCLP_DIAG_PREFIX": str(root / "merge_diag"),
+                    "SCLP_DIAG_JET_PART": str(jet_part),
+                    "SCLP_DIAG_METIS_PART": str(metis_part),
+                })
             subprocess.run(
                 [str(binary), str(root / "indptr.bin"), str(root / "indices.bin"),
                  "4", str(out), "1.10", "0", "1.0", method, "2"],
@@ -144,6 +159,12 @@ def main() -> None:
             ratios = [float(x) for x in re.findall(
                 r"ml_gpu_sclp level=0 .*?contraction_ratio=([0-9.e+-]+)", text)]
             assert ratios and 0.45 <= ratios[0] <= 0.60
+            if merge_diagnostics:
+                records = root / "merge_diag.merges.bin"
+                levels = root / "merge_diag.levels.csv"
+                assert records.stat().st_size > 0
+                assert records.stat().st_size % 104 == 0
+                assert len(levels.read_text().splitlines()) >= 2
     print(f"{method} small hierarchy, capacity, symmetry, coverage, and cut tests passed")
 
 
