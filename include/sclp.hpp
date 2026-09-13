@@ -55,6 +55,8 @@ public:
     SclpWorkspace(const SclpWorkspace&) = delete;
     SclpWorkspace& operator=(const SclpWorkspace&) = delete;
 
+    void reserve_contract_buffers(std::int64_t max_edges);
+
     struct Impl;
     std::unique_ptr<Impl> impl;
 };
@@ -97,7 +99,7 @@ DeviceAggregateResult aggregate(
     int level, SclpStats& stats, bool diagnostics);
 
 DeviceWeightedGraph contract(
-    const DeviceWeightedGraph& fine, const DeviceAggregateResult& aggregate,
+    DeviceWeightedGraph fine, DeviceAggregateResult&& aggregate,
     SclpWorkspace& workspace, ContractionTimings& timings);
 
 }  // namespace sclp

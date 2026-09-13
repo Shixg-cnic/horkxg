@@ -278,6 +278,7 @@ void run_hierarchy(
     const auto device_input_start = std::chrono::steady_clock::now();
     auto current = sclp::make_device_weighted(levels.front());
     sclp::SclpWorkspace workspace;
+    workspace.reserve_contract_buffers(current.edges());
     CUDA_CHECK(cudaDeviceSynchronize());
     const auto device_input_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - device_input_start).count();
@@ -356,7 +357,7 @@ void run_hierarchy(
         sclp::ContractionTimings contract_timings;
         const auto contract_wall_start = std::chrono::steady_clock::now();
         auto coarse_device = sclp::contract(
-            current, aggregate, workspace, contract_timings);
+            std::move(current), std::move(aggregate), workspace, contract_timings);
         const auto level_contract_wall = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - contract_wall_start).count();
         device_algorithm_seconds += level_contract_wall;

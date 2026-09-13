@@ -15,6 +15,7 @@
 #include <thrust/copy.h>
 #include <thrust/execution_policy.h>
 #include <thrust/functional.h>
+#include <thrust/iterator/counting_iterator.h>
 #include <thrust/reduce.h>
 #include <thrust/scan.h>
 #include <thrust/sequence.h>
@@ -119,32 +120,18 @@ __global__ void compact_cross_edges_warp_kernel(
     }
 }
 
-__global__ void count_coarse_rows_kernel(
+__global__ void write_coarse_csr_kernel(
     std::int64_t count, const std::uint64_t* keys,
-    std::int64_t coarse_vertices, std::int64_t* row_counts) {
+    const std::uint64_t* values, std::int32_t* neighbors,
+    std::uint64_t* edge_weights, std::int64_t* offsets) {
     const auto i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) return;
     const auto source = static_cast<std::uint32_t>(keys[i] >> 32);
-    if (source >= static_cast<std::uint32_t>(coarse_vertices)) return;
-    // Store the row count at its source index.  The extra final zero entry is
-    // consumed by the exclusive scan below to produce offsets[nc].
-    atomicAdd(reinterpret_cast<unsigned long long*>(&row_counts[source]), 1ULL);
-}
-
-__global__ void write_coarse_edges_kernel(
-    std::int64_t count, const std::uint64_t* keys,
-    const std::uint64_t* values, std::int32_t* neighbors,
-    std::uint64_t* edge_weights) {
-    const auto i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= count) return;
     neighbors[i] = static_cast<std::int32_t>(keys[i]);
     edge_weights[i] = values[i];
-}
-__global__ void compact_flags_kernel(
-    std::int64_t n, const std::int32_t* flags,
-    const std::int32_t* positions, std::int32_t* output) {
-    const auto v = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (v < n && flags[v]) output[positions[v]] = static_cast<std::int32_t>(v);
+    if (i == 0 || source != static_cast<std::uint32_t>(keys[i - 1] >> 32)) {
+        offsets[source] = i;
+    }
 }
 constexpr int SCLP_LOW_DEGREE = 8;
 constexpr int SCLP_MEDIUM_DEGREE = 256;
@@ -220,6 +207,39 @@ __device__ __forceinline__ void sclp_finish_warp_affinity(
     }
 }
 
+__device__ __forceinline__ void sclp_finish_subwarp_affinity(
+    std::int32_t v, unsigned mask, int lane_in_subwarp,
+    unsigned long long local_current,
+    unsigned long long local_unrestricted,
+    unsigned long long local_best_affinity, unsigned long long local_best_tie,
+    unsigned long long* current_affinity,
+    unsigned long long* best_affinity, unsigned long long* best_ties,
+    unsigned long long* unrestricted_best_affinity) {
+    constexpr int SUBWARP_SIZE = 8;
+    for (int offset = SUBWARP_SIZE / 2; offset > 0; offset /= 2) {
+        local_current = max(
+            local_current, __shfl_down_sync(mask, local_current, offset));
+        local_unrestricted = max(
+            local_unrestricted,
+            __shfl_down_sync(mask, local_unrestricted, offset));
+        const auto other_affinity =
+            __shfl_down_sync(mask, local_best_affinity, offset);
+        const auto other_tie = __shfl_down_sync(mask, local_best_tie, offset);
+        if (sclp_better_candidate(
+                other_affinity, other_tie,
+                local_best_affinity, local_best_tie)) {
+            local_best_affinity = other_affinity;
+            local_best_tie = other_tie;
+        }
+    }
+    if (lane_in_subwarp == 0) {
+        current_affinity[v] = local_current;
+        unrestricted_best_affinity[v] = local_unrestricted;
+        best_affinity[v] = local_best_affinity;
+        best_ties[v] = local_best_tie;
+    }
+}
+
 __global__ void sclp_affinity_low_match_kernel(
     std::int64_t count, const std::int32_t* vertices,
     const std::int64_t* offsets, const std::int32_t* neighbors,
@@ -229,25 +249,36 @@ __global__ void sclp_affinity_low_match_kernel(
     unsigned long long* current_affinity,
     unsigned long long* best_affinity, unsigned long long* best_ties,
     unsigned long long* unrestricted_best_affinity) {
+    constexpr int SUBWARP_SIZE = 8;
     const int lane = threadIdx.x & (WARP_SIZE - 1);
+    const int lane_in_subwarp = lane & (SUBWARP_SIZE - 1);
+    const int subwarp_in_warp = lane / SUBWARP_SIZE;
     const auto warp = static_cast<std::int64_t>(blockIdx.x) *
                       WARPS_PER_BLOCK + threadIdx.x / WARP_SIZE;
-    if (warp >= count) return;
-    const auto v = vertices[warp];
+    const auto vertex_index = warp * (WARP_SIZE / SUBWARP_SIZE) +
+                              subwarp_in_warp;
+    if (vertex_index >= count) return;
+    const auto v = vertices[vertex_index];
     const auto begin = offsets[v];
     const auto degree = offsets[v + 1] - begin;
-    const bool valid = lane < degree && neighbors[begin + lane] != v;
-    const unsigned active = __ballot_sync(0xffffffffU, valid);
+    const int subwarp_begin = subwarp_in_warp * SUBWARP_SIZE;
+    const unsigned subwarp_mask =
+        ((1U << SUBWARP_SIZE) - 1U) << subwarp_begin;
+    const bool valid = lane_in_subwarp < degree &&
+                       neighbors[begin + lane_in_subwarp] != v;
+    const unsigned active = __ballot_sync(subwarp_mask, valid);
     std::int32_t target = SCLP_INVALID;
     unsigned long long connection = 0;
     bool leader = false;
     if (valid) {
-        target = clusters[neighbors[begin + lane]];
+        target = clusters[neighbors[begin + lane_in_subwarp]];
         const unsigned peers = __match_any_sync(active, target);
         leader = lane == (__ffs(peers) - 1);
         const auto my_weight =
-            static_cast<unsigned long long>(edge_weights[begin + lane]);
-        for (int source_lane = 0; source_lane < WARP_SIZE; ++source_lane) {
+            static_cast<unsigned long long>(
+                edge_weights[begin + lane_in_subwarp]);
+        for (int source_lane = subwarp_begin;
+             source_lane < subwarp_begin + SUBWARP_SIZE; ++source_lane) {
             const auto peer_weight =
                 __shfl_sync(active, my_weight, source_lane);
             if (leader && (peers & (1U << source_lane))) {
@@ -273,8 +304,9 @@ __global__ void sclp_affinity_low_match_kernel(
                        (0xffffffffULL - static_cast<std::uint32_t>(target));
         }
     }
-    sclp_finish_warp_affinity(
-        v, local_current, local_unrestricted,
+    sclp_finish_subwarp_affinity(
+        v, subwarp_mask, lane_in_subwarp,
+        local_current, local_unrestricted,
         best_value, best_tie,
         current_affinity, best_affinity, best_ties,
         unrestricted_best_affinity);
@@ -614,7 +646,6 @@ struct SclpWorkspace::Impl {
     thrust::device_vector<std::int32_t> low_flags;
     thrust::device_vector<std::int32_t> medium_flags;
     thrust::device_vector<std::int32_t> high_flags;
-    thrust::device_vector<std::int32_t> positions;
     thrust::device_vector<std::int32_t> low_vertices;
     thrust::device_vector<std::int32_t> medium_vertices;
     thrust::device_vector<std::int32_t> high_vertices;
@@ -629,7 +660,6 @@ struct SclpWorkspace::Impl {
 
     thrust::device_vector<std::int64_t> high_edge_counts;
     thrust::device_vector<std::int64_t> high_edge_offsets;
-    thrust::device_vector<std::int64_t> row_counts;
 
     thrust::device_vector<std::uint32_t> proposal_ties;
     thrust::device_vector<std::uint8_t> radix_temp;
@@ -665,6 +695,31 @@ SclpWorkspace::SclpWorkspace() : impl(std::make_unique<Impl>()) {}
 SclpWorkspace::~SclpWorkspace() = default;
 SclpWorkspace::SclpWorkspace(SclpWorkspace&&) noexcept = default;
 SclpWorkspace& SclpWorkspace::operator=(SclpWorkspace&&) noexcept = default;
+
+void SclpWorkspace::reserve_contract_buffers(std::int64_t max_edges) {
+    if (max_edges < 0) {
+        throw std::invalid_argument("negative contraction buffer size");
+    }
+    auto& ws = *impl;
+    const auto capacity = static_cast<std::size_t>(max_edges);
+    ws.affinity_keys.reserve(capacity);
+    ws.affinity_values.reserve(capacity);
+    ws.unique_keys.reserve(capacity);
+    ws.unique_values.reserve(capacity);
+    ws.affinity_keys.resize(capacity);
+    ws.affinity_values.resize(capacity);
+    ws.unique_keys.resize(capacity);
+    ws.unique_values.resize(capacity);
+    std::size_t radix_bytes = 0;
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        nullptr, radix_bytes,
+        thrust::raw_pointer_cast(ws.affinity_keys.data()),
+        thrust::raw_pointer_cast(ws.unique_keys.data()),
+        thrust::raw_pointer_cast(ws.affinity_values.data()),
+        thrust::raw_pointer_cast(ws.unique_values.data()),
+        static_cast<int>(max_edges)));
+    ws.radix_temp.resize(radix_bytes);
+}
 
 DeviceWeightedGraph make_device_weighted(const WeightedGraph& graph) {
     DeviceWeightedGraph out;
@@ -728,14 +783,12 @@ DeviceAggregateResult aggregate(
     auto& low_flags = ws.low_flags;
     auto& medium_flags = ws.medium_flags;
     auto& high_flags = ws.high_flags;
-    auto& positions = ws.positions;
     auto& low_vertices = ws.low_vertices;
     auto& medium_vertices = ws.medium_vertices;
     auto& high_vertices = ws.high_vertices;
     low_flags.resize(static_cast<std::size_t>(n));
     medium_flags.resize(static_cast<std::size_t>(n));
     high_flags.resize(static_cast<std::size_t>(n));
-    positions.resize(static_cast<std::size_t>(n));
     low_vertices.resize(static_cast<std::size_t>(n));
     medium_vertices.resize(static_cast<std::size_t>(n));
     high_vertices.resize(static_cast<std::size_t>(n));
@@ -747,21 +800,11 @@ DeviceAggregateResult aggregate(
     CUDA_CHECK(cudaGetLastError());
     const auto compact_class = [&](const thrust::device_vector<std::int32_t>& flags,
                                    thrust::device_vector<std::int32_t>& vertices) {
-        thrust::exclusive_scan(flags.begin(), flags.end(), positions.begin());
-        std::int32_t last_position = 0;
-        std::int32_t last_flag = 0;
-        CUDA_CHECK(cudaMemcpy(&last_position,
-            thrust::raw_pointer_cast(positions.data()) + (n - 1),
-            sizeof(last_position), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(&last_flag,
-            thrust::raw_pointer_cast(flags.data()) + (n - 1),
-            sizeof(last_flag), cudaMemcpyDeviceToHost));
-        compact_flags_kernel<<<vertex_blocks, 256>>>(
-            n, thrust::raw_pointer_cast(flags.data()),
-            thrust::raw_pointer_cast(positions.data()),
-            thrust::raw_pointer_cast(vertices.data()));
-        CUDA_CHECK(cudaGetLastError());
-        return static_cast<std::int64_t>(last_position + last_flag);
+        const auto begin = thrust::make_counting_iterator<std::int32_t>(0);
+        const auto end = thrust::copy_if(
+            thrust::device, begin, begin + n, flags.begin(), vertices.begin(),
+            SclpNonzeroWeight{});
+        return static_cast<std::int64_t>(end - vertices.begin());
     };
     const auto low_count = compact_class(low_flags, low_vertices);
     const auto medium_count = compact_class(medium_flags, medium_vertices);
@@ -790,10 +833,12 @@ DeviceAggregateResult aggregate(
     auto& affinity_values = ws.affinity_values;
     auto& unique_keys = ws.unique_keys;
     auto& unique_values = ws.unique_values;
-    affinity_keys.resize(static_cast<std::size_t>(high_edge_count));
-    affinity_values.resize(static_cast<std::size_t>(high_edge_count));
-    unique_keys.resize(static_cast<std::size_t>(high_edge_count));
-    unique_values.resize(static_cast<std::size_t>(high_edge_count));
+    if (affinity_keys.size() < static_cast<std::size_t>(high_edge_count)) {
+        affinity_keys.resize(static_cast<std::size_t>(high_edge_count));
+        affinity_values.resize(static_cast<std::size_t>(high_edge_count));
+        unique_keys.resize(static_cast<std::size_t>(high_edge_count));
+        unique_values.resize(static_cast<std::size_t>(high_edge_count));
+    }
     auto& best_affinity = ws.best_affinity;
     auto& unrestricted_best_affinity = ws.unrestricted_best_affinity;
     auto& current_affinity = ws.current_affinity;
@@ -912,7 +957,8 @@ DeviceAggregateResult aggregate(
             (static_cast<std::uint32_t>(round) * 0x165667b1U) ^ 0xd3a2646cU;
         if (low_count > 0) {
             const int blocks = static_cast<int>(
-                (low_count + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+                (low_count + WARPS_PER_BLOCK * 4 - 1) /
+                (WARPS_PER_BLOCK * 4));
             sclp_affinity_low_match_kernel<<<blocks, 256>>>(
                 low_count, thrust::raw_pointer_cast(low_vertices.data()),
                 thrust::raw_pointer_cast(graph.offsets.data()),
@@ -959,23 +1005,39 @@ DeviceAggregateResult aggregate(
                 thrust::raw_pointer_cast(affinity_keys.data()),
                 thrust::raw_pointer_cast(affinity_values.data()));
             CUDA_CHECK(cudaGetLastError());
-            thrust::sort_by_key(
-                thrust::device, affinity_keys.begin(), affinity_keys.end(),
-                affinity_values.begin());
+            std::size_t affinity_radix_bytes = 0;
+            CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+                nullptr, affinity_radix_bytes,
+                thrust::raw_pointer_cast(affinity_keys.data()),
+                thrust::raw_pointer_cast(unique_keys.data()),
+                thrust::raw_pointer_cast(affinity_values.data()),
+                thrust::raw_pointer_cast(unique_values.data()),
+                static_cast<int>(high_edge_count)));
+            radix_temp.resize(std::max(radix_temp.size(), affinity_radix_bytes));
+            auto affinity_radix_call_bytes = affinity_radix_bytes;
+            CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+                thrust::raw_pointer_cast(radix_temp.data()),
+                affinity_radix_call_bytes,
+                thrust::raw_pointer_cast(affinity_keys.data()),
+                thrust::raw_pointer_cast(unique_keys.data()),
+                thrust::raw_pointer_cast(affinity_values.data()),
+                thrust::raw_pointer_cast(unique_values.data()),
+                static_cast<int>(high_edge_count)));
             const auto valid_end = thrust::lower_bound(
-                thrust::device, affinity_keys.begin(), affinity_keys.end(),
+                thrust::device, unique_keys.begin(),
+                unique_keys.begin() + high_edge_count,
                 INVALID_KEY);
             const auto reduced = thrust::reduce_by_key(
-                thrust::device, affinity_keys.begin(), valid_end,
-                affinity_values.begin(), unique_keys.begin(), unique_values.begin());
+                thrust::device, unique_keys.begin(), valid_end,
+                unique_values.begin(), affinity_keys.begin(), affinity_values.begin());
             unique_count = static_cast<std::int64_t>(
-                reduced.first - unique_keys.begin());
+                reduced.first - affinity_keys.begin());
         }
         if (unique_count > 0) {
             const int blocks = static_cast<int>((unique_count + 255) / 256);
             sclp_affinity_baseline_kernel<<<blocks, 256>>>(
-                unique_count, thrust::raw_pointer_cast(unique_keys.data()),
-                thrust::raw_pointer_cast(unique_values.data()),
+                unique_count, thrust::raw_pointer_cast(affinity_keys.data()),
+                thrust::raw_pointer_cast(affinity_values.data()),
                 thrust::raw_pointer_cast(clusters.data()),
                 role_salt, mover_threshold, filter_roles,
                 thrust::raw_pointer_cast(current_affinity.data()),
@@ -983,8 +1045,8 @@ DeviceAggregateResult aggregate(
                 thrust::raw_pointer_cast(unrestricted_best_affinity.data()));
             CUDA_CHECK(cudaGetLastError());
             sclp_best_tie_kernel<<<blocks, 256>>>(
-                unique_count, thrust::raw_pointer_cast(unique_keys.data()),
-                thrust::raw_pointer_cast(unique_values.data()),
+                unique_count, thrust::raw_pointer_cast(affinity_keys.data()),
+                thrust::raw_pointer_cast(affinity_values.data()),
                 thrust::raw_pointer_cast(clusters.data()),
                 thrust::raw_pointer_cast(best_affinity.data()),
                 tie_salt, role_salt, mover_threshold, filter_roles,
@@ -1334,7 +1396,7 @@ DeviceAggregateResult aggregate(
 }
 
 DeviceWeightedGraph contract(
-    const DeviceWeightedGraph& fine, const DeviceAggregateResult& aggregate,
+    DeviceWeightedGraph fine, DeviceAggregateResult&& aggregate,
     SclpWorkspace& workspace, ContractionTimings& timings) {
     GpuEventTimer contraction_timer;
     auto& ws = *workspace.impl;
@@ -1347,8 +1409,10 @@ DeviceWeightedGraph contract(
     auto& unique_keys = ws.unique_keys;
     auto& unique_values = ws.unique_values;
     auto& cross_counter = ws.cross_counter;
-    keys.resize(static_cast<std::size_t>(m));
-    values.resize(static_cast<std::size_t>(m));
+    if (keys.size() < static_cast<std::size_t>(m)) {
+        keys.resize(static_cast<std::size_t>(m));
+        values.resize(static_cast<std::size_t>(m));
+    }
     cross_counter.resize(1);
     GpuEventTimer compact_timer;
     thrust::fill(cross_counter.begin(), cross_counter.end(), 0ULL);
@@ -1366,8 +1430,10 @@ DeviceWeightedGraph contract(
         &cross_edges, thrust::raw_pointer_cast(cross_counter.data()),
         sizeof(cross_edges), cudaMemcpyDeviceToHost));
     timings.compact_seconds = compact_timer.seconds();
-    unique_keys.resize(static_cast<std::size_t>(cross_edges));
-    unique_values.resize(static_cast<std::size_t>(cross_edges));
+    if (unique_keys.size() < static_cast<std::size_t>(cross_edges)) {
+        unique_keys.resize(static_cast<std::size_t>(cross_edges));
+        unique_values.resize(static_cast<std::size_t>(cross_edges));
+    }
     std::size_t contraction_radix_bytes = 0;
     CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
         nullptr, contraction_radix_bytes,
@@ -1389,7 +1455,8 @@ DeviceWeightedGraph contract(
     timings.sort_seconds = sort_timer.seconds();
     GpuEventTimer reduce_timer;
     const auto reduced = thrust::reduce_by_key(
-        thrust::device, unique_keys.begin(), unique_keys.end(),
+        thrust::device, unique_keys.begin(),
+        unique_keys.begin() + cross_edges,
         unique_values.begin(), keys.begin(), values.begin());
     timings.reduce_seconds = reduce_timer.seconds();
     const auto coarse_edges = static_cast<std::int64_t>(reduced.first - keys.begin());
@@ -1400,34 +1467,32 @@ DeviceWeightedGraph contract(
                   static_cast<double>(cross_edges) / static_cast<double>(m))
               << '\n';
 
-    DeviceWeightedGraph coarse;
+    DeviceWeightedGraph coarse = std::move(fine);
     GpuEventTimer vertex_weight_timer;
-    coarse.vertex_weights = aggregate.vertex_weights;
+    coarse.vertex_weights.resize(static_cast<std::size_t>(aggregate.coarse_vertices));
+    thrust::copy(
+        aggregate.vertex_weights.begin(), aggregate.vertex_weights.end(),
+        coarse.vertex_weights.begin());
     timings.vertex_weight_seconds = vertex_weight_timer.seconds();
     GpuEventTimer csr_build_timer;
     coarse.offsets.resize(static_cast<std::size_t>(aggregate.coarse_vertices) + 1);
-    auto& row_counts = ws.row_counts;
-    row_counts.resize(static_cast<std::size_t>(aggregate.coarse_vertices) + 1);
-    thrust::fill(row_counts.begin(), row_counts.end(), std::int64_t{0});
-    if (coarse_edges > 0) {
-        const int blocks = static_cast<int>((coarse_edges + 255) / 256);
-        count_coarse_rows_kernel<<<blocks, 256>>>(
-            coarse_edges, thrust::raw_pointer_cast(keys.data()),
-            aggregate.coarse_vertices, thrust::raw_pointer_cast(row_counts.data()));
-        CUDA_CHECK(cudaGetLastError());
-    }
-    thrust::exclusive_scan(row_counts.begin(), row_counts.end(), coarse.offsets.begin());
+    thrust::fill(
+        coarse.offsets.begin(), coarse.offsets.end(), coarse_edges);
     coarse.neighbors.resize(static_cast<std::size_t>(coarse_edges));
     coarse.edge_weights.resize(static_cast<std::size_t>(coarse_edges));
     if (coarse_edges > 0) {
         const int blocks = static_cast<int>((coarse_edges + 255) / 256);
-        write_coarse_edges_kernel<<<blocks, 256>>>(
+        write_coarse_csr_kernel<<<blocks, 256>>>(
             coarse_edges, thrust::raw_pointer_cast(keys.data()),
             thrust::raw_pointer_cast(values.data()),
             thrust::raw_pointer_cast(coarse.neighbors.data()),
-            thrust::raw_pointer_cast(coarse.edge_weights.data()));
+            thrust::raw_pointer_cast(coarse.edge_weights.data()),
+            thrust::raw_pointer_cast(coarse.offsets.data()));
         CUDA_CHECK(cudaGetLastError());
     }
+    thrust::inclusive_scan(
+        thrust::device, coarse.offsets.rbegin(), coarse.offsets.rend(),
+        coarse.offsets.rbegin(), thrust::minimum<std::int64_t>());
     timings.csr_build_seconds = csr_build_timer.seconds();
     timings.total_seconds = contraction_timer.seconds();
     return coarse;
