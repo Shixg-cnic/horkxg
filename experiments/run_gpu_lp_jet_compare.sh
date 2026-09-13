@@ -53,7 +53,7 @@ for dataset in "${DATASETS[@]}"; do
             > "${run_dir}/A_jet.log" 2>&1
 
         echo "=== ${dataset} k=${k} seed=${SEED} B=sclp tag=${method_tag} ==="
-        "${SELF_BUILD}/multilevel_lp" "$indptr" "$indices" "$k" \
+        "${SELF_BUILD}/gpart_coarsen_standard" "$indptr" "$indices" "$k" \
             "${run_dir}/B_sclp.hierarchy" "$RATIO" "$SEED" "$STOP_RATIO" \
             sclp 2 "$MAX_LEVELS" \
             > "${run_dir}/B_sclp_coarsen.log" 2>&1

@@ -1,5 +1,5 @@
 #include "check.hpp"
-#include "sclp.hpp"
+#include "coarsen.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -7,8 +7,11 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <thrust/binary_search.h>
 #include <thrust/count.h>
@@ -24,7 +27,7 @@
 #include <cub/device/device_radix_sort.cuh>
 #include <cuda/std/tuple>
 
-namespace sclp {
+namespace gpart {
 namespace {
 class GpuEventTimer {
 public:
@@ -60,15 +63,16 @@ __device__ __forceinline__ std::uint32_t mix32(std::uint32_t x) {
     return x ^ (x >> 16);
 }
 
+template <typename OffsetT, typename WeightT>
 __global__ void weighted_cut_kernel(
-    std::int64_t n, const std::int64_t* offsets,
-    const std::int32_t* neighbors, const std::uint64_t* edge_weights,
+    std::int64_t n, const OffsetT* offsets,
+    const std::int32_t* neighbors, const WeightT* edge_weights,
     const std::int32_t* labels, unsigned long long* cut) {
     const auto v = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (v >= n) return;
     unsigned long long local = 0;
     const int p = labels[v];
-    for (std::int64_t e = offsets[v]; e < offsets[v + 1]; ++e) {
+    for (auto e = offsets[v]; e < offsets[v + 1]; ++e) {
         if (labels[neighbors[e]] != p) local += edge_weights[e];
     }
     if (local) atomicAdd(cut, local);
@@ -78,18 +82,31 @@ constexpr int WARPS_PER_BLOCK = 8;
 constexpr int WARP_SIZE = 32;
 constexpr std::uint64_t INVALID_KEY = std::numeric_limits<std::uint64_t>::max();
 
-__global__ void coarse_vertex_weights_kernel(
-    std::int64_t n, const std::uint64_t* vertex_weights,
-    const std::int32_t* map, std::uint64_t* coarse_weights) {
-    const auto v = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (v >= n) return;
-    atomicAdd(reinterpret_cast<unsigned long long*>(&coarse_weights[map[v]]),
-              static_cast<unsigned long long>(vertex_weights[v]));
+template <typename WeightT>
+__device__ __forceinline__ void atomic_add_graph_weight(
+    WeightT* address, WeightT value) {
+    if constexpr (sizeof(WeightT) == sizeof(std::uint32_t)) {
+        atomicAdd(reinterpret_cast<unsigned int*>(address),
+                  static_cast<unsigned int>(value));
+    } else {
+        atomicAdd(reinterpret_cast<unsigned long long*>(address),
+                  static_cast<unsigned long long>(value));
+    }
 }
 
+template <typename WeightT>
+__global__ void coarse_vertex_weights_kernel(
+    std::int64_t n, const WeightT* vertex_weights,
+    const std::int32_t* map, WeightT* coarse_weights) {
+    const auto v = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (v >= n) return;
+    atomic_add_graph_weight(coarse_weights + map[v], vertex_weights[v]);
+}
+
+template <typename OffsetT, typename WeightT>
 __global__ void compact_cross_edges_warp_kernel(
-    std::int64_t n, const std::int64_t* offsets,
-    const std::int32_t* neighbors, const std::uint64_t* edge_weights,
+    std::int64_t n, const OffsetT* offsets,
+    const std::int32_t* neighbors, const WeightT* edge_weights,
     const std::int32_t* map, std::uint64_t* keys, std::uint64_t* values,
     unsigned long long* cross_count) {
     const int lane = threadIdx.x & (WARP_SIZE - 1);
@@ -120,17 +137,18 @@ __global__ void compact_cross_edges_warp_kernel(
     }
 }
 
+template <typename OffsetT, typename WeightT>
 __global__ void write_coarse_csr_kernel(
     std::int64_t count, const std::uint64_t* keys,
     const std::uint64_t* values, std::int32_t* neighbors,
-    std::uint64_t* edge_weights, std::int64_t* offsets) {
+    WeightT* edge_weights, OffsetT* offsets) {
     const auto i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) return;
     const auto source = static_cast<std::uint32_t>(keys[i] >> 32);
     neighbors[i] = static_cast<std::int32_t>(keys[i]);
-    edge_weights[i] = values[i];
+    edge_weights[i] = static_cast<WeightT>(values[i]);
     if (i == 0 || source != static_cast<std::uint32_t>(keys[i - 1] >> 32)) {
-        offsets[source] = i;
+        offsets[source] = static_cast<OffsetT>(i);
     }
 }
 constexpr int SCLP_LOW_DEGREE = 8;
@@ -139,8 +157,9 @@ constexpr int SCLP_AFFINITY_WARPS_PER_BLOCK = 4;
 constexpr int SCLP_MEDIUM_HASH_SIZE = 512;
 constexpr std::int32_t SCLP_INVALID = 0x7fffffff;
 
+template <typename OffsetT>
 __global__ void sclp_degree_class_kernel(
-    std::int64_t n, const std::int64_t* offsets,
+    std::int64_t n, const OffsetT* offsets,
     std::int32_t* low_flags, std::int32_t* medium_flags,
     std::int32_t* high_flags) {
     const auto v = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -240,10 +259,11 @@ __device__ __forceinline__ void sclp_finish_subwarp_affinity(
     }
 }
 
+template <typename OffsetT, typename WeightT>
 __global__ void sclp_affinity_low_match_kernel(
     std::int64_t count, const std::int32_t* vertices,
-    const std::int64_t* offsets, const std::int32_t* neighbors,
-    const std::uint64_t* edge_weights, const std::int32_t* clusters,
+    const OffsetT* offsets, const std::int32_t* neighbors,
+    const WeightT* edge_weights, const std::int32_t* clusters,
     std::uint32_t role_salt, std::uint32_t mover_threshold,
     std::uint32_t tie_salt, bool filter_roles,
     unsigned long long* current_affinity,
@@ -312,10 +332,11 @@ __global__ void sclp_affinity_low_match_kernel(
         unrestricted_best_affinity);
 }
 
+template <typename OffsetT, typename WeightT>
 __global__ void sclp_affinity_medium_hash_kernel(
     std::int64_t count, const std::int32_t* vertices,
-    const std::int64_t* offsets, const std::int32_t* neighbors,
-    const std::uint64_t* edge_weights, const std::int32_t* clusters,
+    const OffsetT* offsets, const std::int32_t* neighbors,
+    const WeightT* edge_weights, const std::int32_t* clusters,
     std::uint32_t role_salt, std::uint32_t mover_threshold,
     std::uint32_t tie_salt, bool filter_roles,
     unsigned long long* current_affinity,
@@ -384,9 +405,10 @@ __global__ void sclp_affinity_medium_hash_kernel(
         unrestricted_best_affinity);
 }
 
+template <typename OffsetT>
 __global__ void sclp_high_edge_counts_kernel(
     std::int64_t count, const std::int32_t* vertices,
-    const std::int64_t* offsets, std::int64_t* counts) {
+    const OffsetT* offsets, std::int64_t* counts) {
     const auto i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < count) {
         const auto v = vertices[i];
@@ -394,11 +416,12 @@ __global__ void sclp_high_edge_counts_kernel(
     }
 }
 
+template <typename OffsetT, typename WeightT>
 __global__ void sclp_fill_affinity_high_kernel(
     std::int64_t count, const std::int32_t* vertices,
     const std::int64_t* compact_offsets,
-    const std::int64_t* offsets, const std::int32_t* neighbors,
-    const std::uint64_t* edge_weights, const std::int32_t* clusters,
+    const OffsetT* offsets, const std::int32_t* neighbors,
+    const WeightT* edge_weights, const std::int32_t* clusters,
     std::uint64_t* keys, std::uint64_t* values) {
     const auto i = static_cast<std::int64_t>(blockIdx.x);
     if (i >= count) return;
@@ -535,9 +558,10 @@ __global__ void sclp_admission_keys_kernel(
         static_cast<std::uint32_t>(v)};
 }
 
+template <typename WeightT>
 __global__ void sclp_decode_admission_keys_kernel(
     std::int64_t count, const SclpAdmissionKey* keys,
-    const std::uint64_t* vertex_weights, std::int32_t* order,
+    const WeightT* vertex_weights, std::int32_t* order,
     std::int32_t* targets, std::uint64_t* weights) {
     const auto i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) return;
@@ -583,8 +607,9 @@ __global__ void sclp_commit_kernel(
     }
 }
 
+template <typename WeightT>
 __global__ void sclp_singleton_favorite_kernel(
-    std::int64_t n, const std::uint64_t* vertex_weights,
+    std::int64_t n, const WeightT* vertex_weights,
     const unsigned long long* cluster_weights, const std::int32_t* clusters,
     const std::int32_t* proposals, std::int32_t* favorites) {
     const auto v = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -641,18 +666,22 @@ __global__ void sclp_compact_map_kernel(
 }
 }  // namespace
 
-struct SclpWorkspace::Impl {
-    thrust::device_vector<std::int32_t> clusters;
+template <typename Types>
+struct SclpWorkspace<Types>::Impl {
+    using VertexT = typename Types::VertexT;
+    using WeightT = typename Types::WeightT;
+
+    thrust::device_vector<VertexT> clusters;
     thrust::device_vector<std::int32_t> low_flags;
     thrust::device_vector<std::int32_t> medium_flags;
     thrust::device_vector<std::int32_t> high_flags;
-    thrust::device_vector<std::int32_t> low_vertices;
-    thrust::device_vector<std::int32_t> medium_vertices;
-    thrust::device_vector<std::int32_t> high_vertices;
-    thrust::device_vector<std::int32_t> proposals;
-    thrust::device_vector<std::int32_t> order;
-    thrust::device_vector<std::int32_t> ordered_targets;
-    thrust::device_vector<std::int32_t> favorites;
+    thrust::device_vector<VertexT> low_vertices;
+    thrust::device_vector<VertexT> medium_vertices;
+    thrust::device_vector<VertexT> high_vertices;
+    thrust::device_vector<VertexT> proposals;
+    thrust::device_vector<VertexT> order;
+    thrust::device_vector<VertexT> ordered_targets;
+    thrust::device_vector<VertexT> favorites;
     thrust::device_vector<std::int32_t> pair_flags;
     thrust::device_vector<std::int32_t> pair_positions;
     thrust::device_vector<std::int32_t> nonempty_flags;
@@ -688,15 +717,20 @@ struct SclpWorkspace::Impl {
     thrust::device_vector<unsigned long long> cross_counter;
     thrust::device_vector<std::uint64_t> diagnostic_member_counts;
     thrust::device_vector<std::uint64_t> diagnostic_unit_weights;
-    thrust::device_vector<std::uint64_t> diagnostic_sorted_cluster_weights;
+    thrust::device_vector<WeightT> diagnostic_sorted_cluster_weights;
 };
 
-SclpWorkspace::SclpWorkspace() : impl(std::make_unique<Impl>()) {}
-SclpWorkspace::~SclpWorkspace() = default;
-SclpWorkspace::SclpWorkspace(SclpWorkspace&&) noexcept = default;
-SclpWorkspace& SclpWorkspace::operator=(SclpWorkspace&&) noexcept = default;
+template <typename Types>
+SclpWorkspace<Types>::SclpWorkspace() : impl(std::make_unique<Impl>()) {}
+template <typename Types>
+SclpWorkspace<Types>::~SclpWorkspace() = default;
+template <typename Types>
+SclpWorkspace<Types>::SclpWorkspace(SclpWorkspace&&) noexcept = default;
+template <typename Types>
+SclpWorkspace<Types>& SclpWorkspace<Types>::operator=(SclpWorkspace&&) noexcept = default;
 
-void SclpWorkspace::reserve_contract_buffers(std::int64_t max_edges) {
+template <typename Types>
+void SclpWorkspace<Types>::reserve_contract_buffers(std::int64_t max_edges) {
     if (max_edges < 0) {
         throw std::invalid_argument("negative contraction buffer size");
     }
@@ -717,34 +751,13 @@ void SclpWorkspace::reserve_contract_buffers(std::int64_t max_edges) {
         thrust::raw_pointer_cast(ws.unique_keys.data()),
         thrust::raw_pointer_cast(ws.affinity_values.data()),
         thrust::raw_pointer_cast(ws.unique_values.data()),
-        static_cast<int>(max_edges)));
+        static_cast<typename Types::OffsetT>(max_edges)));
     ws.radix_temp.resize(radix_bytes);
 }
 
-DeviceWeightedGraph make_device_weighted(const WeightedGraph& graph) {
-    DeviceWeightedGraph out;
-    out.offsets = graph.offsets;
-    out.neighbors = graph.neighbors;
-    out.edge_weights = graph.edge_weights;
-    out.vertex_weights = graph.vertex_weights;
-    return out;
-}
-
-WeightedGraph copy_device_weighted(const DeviceWeightedGraph& graph) {
-    WeightedGraph out;
-    out.offsets.resize(graph.offsets.size());
-    out.neighbors.resize(graph.neighbors.size());
-    out.edge_weights.resize(graph.edge_weights.size());
-    out.vertex_weights.resize(graph.vertex_weights.size());
-    thrust::copy(graph.offsets.begin(), graph.offsets.end(), out.offsets.begin());
-    thrust::copy(graph.neighbors.begin(), graph.neighbors.end(), out.neighbors.begin());
-    thrust::copy(graph.edge_weights.begin(), graph.edge_weights.end(), out.edge_weights.begin());
-    thrust::copy(graph.vertex_weights.begin(), graph.vertex_weights.end(), out.vertex_weights.begin());
-    return out;
-}
-
-DeviceAggregateResult aggregate(
-    const DeviceWeightedGraph& graph, SclpWorkspace& workspace,
+template <typename Types>
+DeviceAggregateResult<Types> aggregate(
+    const DeviceWeightedGraph<Types>& graph, SclpWorkspace<Types>& workspace,
     int parts, std::uint32_t seed,
     int level, SclpStats& stats, bool diagnostics) {
     auto& ws = *workspace.impl;
@@ -1012,7 +1025,7 @@ DeviceAggregateResult aggregate(
                 thrust::raw_pointer_cast(unique_keys.data()),
                 thrust::raw_pointer_cast(affinity_values.data()),
                 thrust::raw_pointer_cast(unique_values.data()),
-                static_cast<int>(high_edge_count)));
+                static_cast<typename Types::OffsetT>(high_edge_count)));
             radix_temp.resize(std::max(radix_temp.size(), affinity_radix_bytes));
             auto affinity_radix_call_bytes = affinity_radix_bytes;
             CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
@@ -1022,7 +1035,7 @@ DeviceAggregateResult aggregate(
                 thrust::raw_pointer_cast(unique_keys.data()),
                 thrust::raw_pointer_cast(affinity_values.data()),
                 thrust::raw_pointer_cast(unique_values.data()),
-                static_cast<int>(high_edge_count)));
+                static_cast<typename Types::OffsetT>(high_edge_count)));
             const auto valid_end = thrust::lower_bound(
                 thrust::device, unique_keys.begin(),
                 unique_keys.begin() + high_edge_count,
@@ -1289,7 +1302,7 @@ DeviceAggregateResult aggregate(
     thrust::exclusive_scan(nonempty_flags.begin(), nonempty_flags.end(),
                            compact_ids.begin());
 
-    DeviceAggregateResult out;
+    DeviceAggregateResult<Types> out;
     out.coarse_vertices = static_cast<std::int32_t>(cluster_count);
     out.capacity = stats.capacity;
     out.map.resize(static_cast<std::size_t>(n));
@@ -1299,7 +1312,9 @@ DeviceAggregateResult aggregate(
         thrust::raw_pointer_cast(out.map.data()));
     CUDA_CHECK(cudaGetLastError());
     out.vertex_weights.resize(static_cast<std::size_t>(out.coarse_vertices));
-    thrust::fill(out.vertex_weights.begin(), out.vertex_weights.end(), std::uint64_t{0});
+    thrust::fill(
+        out.vertex_weights.begin(), out.vertex_weights.end(),
+        typename Types::WeightT{0});
     coarse_vertex_weights_kernel<<<vertex_blocks, 256>>>(
         n, thrust::raw_pointer_cast(graph.vertex_weights.data()),
         thrust::raw_pointer_cast(out.map.data()),
@@ -1395,9 +1410,10 @@ DeviceAggregateResult aggregate(
     return out;
 }
 
-DeviceWeightedGraph contract(
-    DeviceWeightedGraph fine, DeviceAggregateResult&& aggregate,
-    SclpWorkspace& workspace, ContractionTimings& timings) {
+template <typename Types>
+DeviceWeightedGraph<Types> contract(
+    DeviceWeightedGraph<Types> fine, DeviceAggregateResult<Types>&& aggregate,
+    SclpWorkspace<Types>& workspace, ContractionTimings& timings) {
     GpuEventTimer contraction_timer;
     auto& ws = *workspace.impl;
     const auto n = fine.vertices();
@@ -1441,7 +1457,7 @@ DeviceWeightedGraph contract(
         thrust::raw_pointer_cast(unique_keys.data()),
         thrust::raw_pointer_cast(values.data()),
         thrust::raw_pointer_cast(unique_values.data()),
-        static_cast<int>(cross_edges)));
+        static_cast<typename Types::OffsetT>(cross_edges)));
     ws.radix_temp.resize(contraction_radix_bytes);
     GpuEventTimer sort_timer;
     auto call_radix_bytes = contraction_radix_bytes;
@@ -1451,7 +1467,7 @@ DeviceWeightedGraph contract(
         thrust::raw_pointer_cast(unique_keys.data()),
         thrust::raw_pointer_cast(values.data()),
         thrust::raw_pointer_cast(unique_values.data()),
-        static_cast<int>(cross_edges)));
+        static_cast<typename Types::OffsetT>(cross_edges)));
     timings.sort_seconds = sort_timer.seconds();
     GpuEventTimer reduce_timer;
     const auto reduced = thrust::reduce_by_key(
@@ -1467,7 +1483,7 @@ DeviceWeightedGraph contract(
                   static_cast<double>(cross_edges) / static_cast<double>(m))
               << '\n';
 
-    DeviceWeightedGraph coarse = std::move(fine);
+    DeviceWeightedGraph<Types> coarse = std::move(fine);
     GpuEventTimer vertex_weight_timer;
     coarse.vertex_weights.resize(static_cast<std::size_t>(aggregate.coarse_vertices));
     thrust::copy(
@@ -1492,10 +1508,305 @@ DeviceWeightedGraph contract(
     }
     thrust::inclusive_scan(
         thrust::device, coarse.offsets.rbegin(), coarse.offsets.rend(),
-        coarse.offsets.rbegin(), thrust::minimum<std::int64_t>());
+        coarse.offsets.rbegin(),
+        thrust::minimum<typename Types::OffsetT>());
     timings.csr_build_seconds = csr_build_timer.seconds();
     timings.total_seconds = contraction_timer.seconds();
     return coarse;
 }
 
-}  // namespace sclp
+namespace {
+
+template <typename Types>
+void validate_coarsening_step(
+    const WeightedGraph<Types>& fine, const WeightedGraph<Types>& coarse,
+    const std::vector<typename Types::VertexT>& map,
+    std::uint64_t cluster_cap, int level, bool strict_verify) {
+    using VertexT = typename Types::VertexT;
+    if (map.size() != static_cast<std::size_t>(fine.vertices())) {
+        throw std::runtime_error("coarsening map has the wrong length");
+    }
+    if (coarse.vertices() <= 0 || coarse.vertices() > fine.vertices()) {
+        throw std::runtime_error("coarsening produced an invalid vertex count");
+    }
+    std::vector<std::uint64_t> recomputed(
+        static_cast<std::size_t>(coarse.vertices()), 0);
+    std::vector<std::uint64_t> coverage(
+        static_cast<std::size_t>(coarse.vertices()), 0);
+    for (std::int64_t v = 0; v < fine.vertices(); ++v) {
+        const auto c = map[static_cast<std::size_t>(v)];
+        if (c < 0 || c >= coarse.vertices()) {
+            throw std::runtime_error("coarsening map contains an out-of-range id");
+        }
+        recomputed[static_cast<std::size_t>(c)] += static_cast<std::uint64_t>(
+            fine.vertex_weights[static_cast<std::size_t>(v)]);
+        ++coverage[static_cast<std::size_t>(c)];
+    }
+    const auto sum_weights = [](const auto& weights) {
+        return std::accumulate(
+            weights.begin(), weights.end(), std::uint64_t{0},
+            [](std::uint64_t total, auto value) {
+                return total + static_cast<std::uint64_t>(value);
+            });
+    };
+    if (sum_weights(fine.vertex_weights) != sum_weights(coarse.vertex_weights)) {
+        throw std::runtime_error("coarsening did not conserve vertex weight");
+    }
+    for (std::int64_t c = 0; c < coarse.vertices(); ++c) {
+        if (coverage[static_cast<std::size_t>(c)] == 0 ||
+            recomputed[static_cast<std::size_t>(c)] != static_cast<std::uint64_t>(
+                coarse.vertex_weights[static_cast<std::size_t>(c)])) {
+            throw std::runtime_error("coarsening cluster weight mismatch");
+        }
+        if (static_cast<std::uint64_t>(
+                coarse.vertex_weights[static_cast<std::size_t>(c)]) > cluster_cap) {
+            throw std::runtime_error("coarse point exceeds configured weight cap");
+        }
+    }
+    if (strict_verify) {
+        validate_weighted_csr(coarse, false);
+    } else {
+        validate_weighted_shape(coarse, false);
+    }
+
+    std::vector<VertexT> coarse_labels(
+        static_cast<std::size_t>(coarse.vertices()));
+    for (std::int64_t c = 0; c < coarse.vertices(); ++c) {
+        coarse_labels[static_cast<std::size_t>(c)] =
+            static_cast<VertexT>((c * 2654435761ULL + 17) % 23);
+    }
+    std::vector<VertexT> fine_labels(map.size());
+    for (std::size_t v = 0; v < map.size(); ++v) {
+        fine_labels[v] = coarse_labels[static_cast<std::size_t>(map[v])];
+    }
+    if (host_cut(fine, fine_labels) != host_cut(coarse, coarse_labels)) {
+        throw std::runtime_error("cut is not conserved by coarse projection");
+    }
+    std::cout << "ml_layer_verify level=" << level
+              << " map=ok weights=ok csr=ok projection_cut=ok\n";
+}
+
+}  // namespace
+
+template <typename Types>
+Hierarchy<Types> coarsen(
+    const WeightedGraph<Types>& graph, const CoarsenOptions& options) {
+    using VertexT = typename Types::VertexT;
+    const bool diagnostics = std::getenv("SCLP_DIAGNOSTICS") != nullptr;
+    const bool verify = options.strict_verify ||
+                        std::getenv("SCLP_VERIFY") != nullptr;
+    const auto host_graph_build_start = std::chrono::steady_clock::now();
+    Hierarchy<Types> hierarchy;
+    hierarchy.levels.push_back(graph);
+    const auto host_graph_build_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - host_graph_build_start).count();
+
+    const auto input_verify_start = std::chrono::steady_clock::now();
+    if (options.strict_verify) {
+        validate_weighted_csr(hierarchy.levels.front(), true);
+    } else {
+        validate_weighted_shape(hierarchy.levels.front(), true);
+        std::vector<VertexT> labels(
+            static_cast<std::size_t>(hierarchy.levels.front().vertices()));
+        for (std::int64_t v = 0; v < hierarchy.levels.front().vertices(); ++v) {
+            labels[static_cast<std::size_t>(v)] =
+                static_cast<VertexT>((v * 2654435761ULL + 17) % 23);
+        }
+        (void)host_cut(hierarchy.levels.front(), labels);
+    }
+    const auto input_verify_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - input_verify_start).count();
+    std::cout << "ml_input_verify_seconds=" << input_verify_seconds
+              << " status=ok mode="
+              << (options.strict_verify ? "strict" : "fast") << '\n';
+
+    const auto device_input_start = std::chrono::steady_clock::now();
+    auto current = make_device_weighted(hierarchy.levels.front());
+    SclpWorkspace<Types> workspace;
+    workspace.reserve_contract_buffers(current.edges());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    const auto device_input_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - device_input_start).count();
+    std::cout << "ml_gpu_device_input_seconds=" << device_input_seconds
+              << " method=sclp\n";
+
+    const std::int64_t cutoff = std::max<std::int64_t>(
+        32, kBeta * static_cast<std::int64_t>(options.parts));
+    const auto core_start = std::chrono::steady_clock::now();
+    double device_algorithm_seconds = 0.0;
+    double aggregate_wall_seconds = 0.0;
+    double contraction_wall_seconds = 0.0;
+    double snapshot_seconds = 0.0;
+    double aggregate_gpu_seconds = 0.0;
+    double affinity_gpu_seconds = 0.0;
+    double admission_gpu_seconds = 0.0;
+    double two_hop_gpu_seconds = 0.0;
+    double compact_gpu_seconds = 0.0;
+    double contraction_gpu_seconds = 0.0;
+    double contraction_compact_gpu_seconds = 0.0;
+    double contraction_sort_gpu_seconds = 0.0;
+    double contraction_reduce_gpu_seconds = 0.0;
+    double contraction_csr_gpu_seconds = 0.0;
+    double contraction_vertex_weight_gpu_seconds = 0.0;
+    int level = 0;
+    for (; level < options.max_levels && current.vertices() > cutoff; ++level) {
+        const auto level_seed = options.seed + static_cast<std::uint32_t>(level);
+        std::cout << "ml_coarsen_begin level=" << level
+                  << " vertices=" << current.vertices()
+                  << " edges=" << current.edges()
+                  << " method=sclp seed=" << level_seed << '\n';
+        SclpStats stats;
+        const auto aggregate_start = std::chrono::steady_clock::now();
+        auto aggregate_result = aggregate(
+            current, workspace, options.parts, level_seed,
+            level, stats, diagnostics);
+        const auto level_aggregate_wall = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - aggregate_start).count();
+        device_algorithm_seconds += level_aggregate_wall;
+        aggregate_wall_seconds += level_aggregate_wall;
+        const double contraction =
+            static_cast<double>(aggregate_result.coarse_vertices) /
+            static_cast<double>(current.vertices());
+        affinity_gpu_seconds += stats.affinity_seconds;
+        admission_gpu_seconds += stats.admission_seconds;
+        two_hop_gpu_seconds += stats.two_hop_seconds;
+        compact_gpu_seconds += stats.compact_seconds;
+        aggregate_gpu_seconds += stats.aggregate_seconds;
+        const auto aggregate_other_seconds = std::max(
+            0.0, stats.aggregate_seconds - stats.affinity_seconds -
+            stats.admission_seconds - stats.two_hop_seconds -
+            stats.compact_seconds);
+        std::cout << "ml_coarsen_map level=" << level
+                  << " coarse_vertices=" << aggregate_result.coarse_vertices
+                  << " ratio=" << contraction
+                  << " maximum_weight=" << aggregate_result.maximum_weight
+                  << " capacity=" << aggregate_result.capacity << '\n';
+        if (aggregate_result.coarse_vertices >= current.vertices() ||
+            contraction > options.stop_contraction_ratio) {
+            std::cout << "ml_gpu_timing level=" << level
+                      << " affinity_seconds=" << stats.affinity_seconds
+                      << " admission_seconds=" << stats.admission_seconds
+                      << " two_hop_seconds=" << stats.two_hop_seconds
+                      << " compact_seconds=" << stats.compact_seconds
+                      << " aggregate_other_seconds=" << aggregate_other_seconds
+                      << " aggregate_total_seconds=" << stats.aggregate_seconds
+                      << " contraction_seconds=0\n";
+            std::cout << "ml_coarsen_stop reason=insufficient_contraction\n";
+            hierarchy.stop_reason = "insufficient_contraction";
+            break;
+        }
+
+        ContractionTimings contract_timings;
+        const auto contract_wall_start = std::chrono::steady_clock::now();
+        auto coarse_device = contract(
+            std::move(current), std::move(aggregate_result),
+            workspace, contract_timings);
+        const auto level_contract_wall = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - contract_wall_start).count();
+        device_algorithm_seconds += level_contract_wall;
+        contraction_wall_seconds += level_contract_wall;
+        contraction_gpu_seconds += contract_timings.total_seconds;
+        contraction_compact_gpu_seconds += contract_timings.compact_seconds;
+        contraction_sort_gpu_seconds += contract_timings.sort_seconds;
+        contraction_reduce_gpu_seconds += contract_timings.reduce_seconds;
+        contraction_csr_gpu_seconds += contract_timings.csr_build_seconds;
+        contraction_vertex_weight_gpu_seconds +=
+            contract_timings.vertex_weight_seconds;
+        std::cout << "ml_gpu_timing level=" << level
+                  << " affinity_seconds=" << stats.affinity_seconds
+                  << " admission_seconds=" << stats.admission_seconds
+                  << " two_hop_seconds=" << stats.two_hop_seconds
+                  << " compact_seconds=" << stats.compact_seconds
+                  << " aggregate_other_seconds=" << aggregate_other_seconds
+                  << " aggregate_total_seconds=" << stats.aggregate_seconds
+                  << " contraction_seconds=" << contract_timings.total_seconds
+                  << '\n';
+        std::cout << "ml_gpu_contraction_timing level=" << level
+                  << " compact_seconds=" << contract_timings.compact_seconds
+                  << " sort_seconds=" << contract_timings.sort_seconds
+                  << " reduce_seconds=" << contract_timings.reduce_seconds
+                  << " csr_build_seconds=" << contract_timings.csr_build_seconds
+                  << " vertex_weight_seconds="
+                  << contract_timings.vertex_weight_seconds
+                  << " total_seconds=" << contract_timings.total_seconds << '\n';
+        std::cout << "ml_gpu_contract_seconds level=" << level
+                  << " seconds=" << contract_timings.total_seconds
+                  << " coarse_edges=" << coarse_device.edges() << '\n';
+
+        const auto snapshot_start = std::chrono::steady_clock::now();
+        std::vector<VertexT> host_map(aggregate_result.map.size());
+        thrust::copy(
+            aggregate_result.map.begin(), aggregate_result.map.end(),
+            host_map.begin());
+        auto coarse_host = copy_device_weighted(coarse_device);
+        const auto snapshot = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - snapshot_start).count();
+        snapshot_seconds += snapshot;
+        std::cout << "ml_gpu_device_snapshot_seconds level=" << level
+                  << " seconds=" << snapshot << '\n';
+
+        if (verify) {
+            const auto verify_start = std::chrono::steady_clock::now();
+            validate_coarsening_step(
+                hierarchy.levels.back(), coarse_host, host_map,
+                aggregate_result.capacity, level, options.strict_verify);
+            std::cout << "ml_gpu_device_verify_seconds level=" << level
+                      << " seconds=" << std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - verify_start).count()
+                      << '\n';
+        }
+        hierarchy.fine_to_coarse.push_back(std::move(host_map));
+        hierarchy.levels.push_back(std::move(coarse_host));
+        current = std::move(coarse_device);
+    }
+    if (level == options.max_levels && current.vertices() > cutoff) {
+        hierarchy.stop_reason = "max_levels";
+    }
+    hierarchy.hierarchy_loop_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - core_start).count();
+    hierarchy.snapshot_seconds = snapshot_seconds;
+    std::cout << "ml_gpu_device_core_seconds=" << device_algorithm_seconds
+              << " aggregate_plus_contract=1 method=sclp\n";
+    std::cout << "ml_gpu_timing_total"
+              << " affinity_seconds=" << affinity_gpu_seconds
+              << " admission_seconds=" << admission_gpu_seconds
+              << " two_hop_seconds=" << two_hop_gpu_seconds
+              << " compact_seconds=" << compact_gpu_seconds
+              << " aggregate_other_seconds=" << std::max(
+                     0.0, aggregate_gpu_seconds - affinity_gpu_seconds -
+                     admission_gpu_seconds - two_hop_gpu_seconds -
+                     compact_gpu_seconds)
+              << " aggregate_total_seconds=" << aggregate_gpu_seconds
+              << " contraction_seconds=" << contraction_gpu_seconds << '\n';
+    std::cout << "ml_gpu_contraction_timing_total"
+              << " compact_seconds=" << contraction_compact_gpu_seconds
+              << " sort_seconds=" << contraction_sort_gpu_seconds
+              << " reduce_seconds=" << contraction_reduce_gpu_seconds
+              << " csr_build_seconds=" << contraction_csr_gpu_seconds
+              << " vertex_weight_seconds="
+              << contraction_vertex_weight_gpu_seconds
+              << " total_seconds=" << contraction_gpu_seconds << '\n';
+    std::cout << "ml_wall_timing_total"
+              << " host_graph_build_seconds=" << host_graph_build_seconds
+              << " input_verify_seconds=" << input_verify_seconds
+              << " device_input_seconds=" << device_input_seconds
+              << " aggregate_seconds=" << aggregate_wall_seconds
+              << " contraction_seconds=" << contraction_wall_seconds
+              << " snapshot_seconds=" << snapshot_seconds << '\n';
+    std::cout << "ml_hierarchy_loop_seconds="
+              << hierarchy.hierarchy_loop_seconds
+              << " includes_snapshot_and_verify=1 method=sclp\n";
+    return hierarchy;
+}
+
+template class SclpWorkspace<ActiveTypes>;
+template DeviceAggregateResult<ActiveTypes> aggregate<ActiveTypes>(
+    const DeviceWeightedGraph<ActiveTypes>&, SclpWorkspace<ActiveTypes>&,
+    int, std::uint32_t, int, SclpStats&, bool);
+template DeviceWeightedGraph<ActiveTypes> contract<ActiveTypes>(
+    DeviceWeightedGraph<ActiveTypes>, DeviceAggregateResult<ActiveTypes>&&,
+    SclpWorkspace<ActiveTypes>&, ContractionTimings&);
+template Hierarchy<ActiveTypes> coarsen<ActiveTypes>(
+    const WeightedGraph<ActiveTypes>&, const CoarsenOptions&);
+
+}  // namespace gpart

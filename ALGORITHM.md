@@ -1,8 +1,9 @@
 # SCLP GPU 粗化
 
-本目录只保留 SCLP 主线：`src/main.cu` 负责层次驱动、校验和 Jet hierarchy
-导出，`src/sclp.cu` 负责聚合、admission 和 GPU contraction，`src/graph.cpp`
-负责读取 64-bit CSR。
+本目录只保留 SCLP 粗化主线：`app/coarsen_main.cu` 是薄入口，
+`src/coarsen.cu` 负责层次驱动、聚合、admission 和 GPU contraction，
+`src/graph.cpp` 负责读取 binary CSR 与 host/device 图转换。相同源码通过
+`StandardTypes` 或 `BigTypes` 实例化为两个粗化程序。
 
 参数固定为 `beta=256`、最多 `4` 轮、two-hop 触发阈值 `0.60`。这些值是
 编译期常量，不再读取环境变量，也不按数据集或 k 搜索参数。

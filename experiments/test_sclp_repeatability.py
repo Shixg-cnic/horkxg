@@ -38,7 +38,8 @@ def main() -> None:
     parser.add_argument("--stop-ratio", type=float, default=0.90)
     parser.add_argument("--max-levels", type=int, default=24)
     parser.add_argument(
-        "--binary", default=str(PROJECT_ROOT / "build-gh200/multilevel_lp")
+        "--binary", default=str(
+            PROJECT_ROOT / "build-gh200/gpart_coarsen_standard")
     )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--output-dir", default=str(DEFAULT_RESULTS))

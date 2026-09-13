@@ -1,51 +1,35 @@
 #pragma once
 
+#include "graph.hpp"
+#include "hierarchy.hpp"
+
 #include <cstdint>
 #include <memory>
-#include <vector>
 
 #include <thrust/device_vector.h>
 
-namespace sclp {
+namespace gpart {
 
 inline constexpr std::int64_t kBeta = 256;
 
-struct WeightedGraph {
-    std::vector<std::int64_t> offsets;
-    std::vector<std::int32_t> neighbors;
-    std::vector<std::uint64_t> edge_weights;
-    std::vector<std::uint64_t> vertex_weights;
-
-    std::int64_t vertices() const {
-        return static_cast<std::int64_t>(vertex_weights.size());
-    }
-    std::int64_t edges() const {
-        return static_cast<std::int64_t>(neighbors.size());
-    }
+struct CoarsenOptions {
+    int parts = 4;
+    std::uint32_t seed = 0;
+    double stop_contraction_ratio = 0.90;
+    int max_levels = 24;
+    bool strict_verify = false;
 };
 
-struct DeviceWeightedGraph {
-    thrust::device_vector<std::int64_t> offsets;
-    thrust::device_vector<std::int32_t> neighbors;
-    thrust::device_vector<std::uint64_t> edge_weights;
-    thrust::device_vector<std::uint64_t> vertex_weights;
-
-    std::int64_t vertices() const {
-        return static_cast<std::int64_t>(vertex_weights.size());
-    }
-    std::int64_t edges() const {
-        return static_cast<std::int64_t>(neighbors.size());
-    }
-};
-
+template <typename Types>
 struct DeviceAggregateResult {
-    thrust::device_vector<std::int32_t> map;
-    thrust::device_vector<std::uint64_t> vertex_weights;
-    std::int32_t coarse_vertices = 0;
+    thrust::device_vector<typename Types::VertexT> map;
+    thrust::device_vector<typename Types::WeightT> vertex_weights;
+    typename Types::VertexT coarse_vertices = 0;
     std::uint64_t maximum_weight = 0;
     std::uint64_t capacity = 0;
 };
 
+template <typename Types>
 class SclpWorkspace {
 public:
     SclpWorkspace();
@@ -90,16 +74,20 @@ struct ContractionTimings {
     double vertex_weight_seconds = 0.0;
 };
 
-DeviceWeightedGraph make_device_weighted(const WeightedGraph& graph);
-WeightedGraph copy_device_weighted(const DeviceWeightedGraph& graph);
-
-DeviceAggregateResult aggregate(
-    const DeviceWeightedGraph& graph, SclpWorkspace& workspace,
+template <typename Types>
+DeviceAggregateResult<Types> aggregate(
+    const DeviceWeightedGraph<Types>& graph, SclpWorkspace<Types>& workspace,
     int parts, std::uint32_t seed,
     int level, SclpStats& stats, bool diagnostics);
 
-DeviceWeightedGraph contract(
-    DeviceWeightedGraph fine, DeviceAggregateResult&& aggregate,
-    SclpWorkspace& workspace, ContractionTimings& timings);
+template <typename Types>
+DeviceWeightedGraph<Types> contract(
+    DeviceWeightedGraph<Types> fine,
+    DeviceAggregateResult<Types>&& aggregate,
+    SclpWorkspace<Types>& workspace, ContractionTimings& timings);
 
-}  // namespace sclp
+template <typename Types>
+Hierarchy<Types> coarsen(
+    const WeightedGraph<Types>& graph, const CoarsenOptions& options);
+
+}  // namespace gpart

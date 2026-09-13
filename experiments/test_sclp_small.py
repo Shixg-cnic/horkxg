@@ -112,7 +112,8 @@ def check(path: Path, capacities: list[int]) -> None:
 
 
 def main() -> None:
-    binary = Path(os.environ.get("MULTILEVEL_BIN", "build-gh200/multilevel_lp"))
+    binary = Path(os.environ.get(
+        "MULTILEVEL_BIN", "build-gh200/gpart_coarsen_standard"))
     method = "sclp"
     with tempfile.TemporaryDirectory(prefix="sclp-small-") as tmp:
         root = Path(tmp)
