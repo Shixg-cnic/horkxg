@@ -25,11 +25,28 @@ struct RefineStats {
     double seconds = 0.0;
 };
 
+struct PairRefineStats {
+    std::uint64_t candidates = 0;
+    std::uint64_t mutual_pairs = 0;
+    std::uint64_t accepted = 0;
+    std::uint64_t cut_before = 0;
+    std::uint64_t cut_after = 0;
+    bool rollback = false;
+};
+
 template <typename Types>
 void refine_partition(
     const WeightedGraph<Types>& graph,
     std::vector<typename Types::VertexT>& partition,
     const RefineOptions& options,
     RefineStats* stats = nullptr);
+
+template <typename Types>
+void coordinated_pair_escape(
+    const WeightedGraph<Types>& graph,
+    std::vector<typename Types::VertexT>& partition,
+    const RefineOptions& options,
+    int level,
+    PairRefineStats* stats = nullptr);
 
 }  // namespace gpart

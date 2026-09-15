@@ -126,6 +126,15 @@ std::vector<typename Types::VertexT> uncoarsen(
             projected_weights.begin(), projected_weights.end());
         RefineStats stats;
         refine_partition(fine, projected, options, &stats);
+        PairRefineStats pair_stats;
+        coordinated_pair_escape(
+            fine, projected, options, static_cast<int>(fine_level),
+            &pair_stats);
+        auto cleanup_options = options;
+        cleanup_options.max_rounds = 1;
+        RefineStats cleanup_stats;
+        refine_partition(
+            fine, projected, cleanup_options, &cleanup_stats);
         std::cout << std::setprecision(10)
                   << "uncoarsen_level=" << fine_level
                   << " vertices=" << fine.vertices()
@@ -134,13 +143,23 @@ std::vector<typename Types::VertexT> uncoarsen(
                   << " projection_max_part_weight=" << projected_max
                   << " projection_imbalance="
                   << imbalance_of(projected_weights, projected_total)
-                  << " refine_rounds=" << stats.rounds
-                  << " refine_proposals=" << stats.proposals
-                  << " refine_accepted=" << stats.accepted
-                  << " refined_cut=" << stats.final_cut
+                  << " refine_rounds=" << (stats.rounds + cleanup_stats.rounds)
+                  << " refine_proposals="
+                  << (stats.proposals + cleanup_stats.proposals)
+                  << " refine_accepted="
+                  << (stats.accepted + cleanup_stats.accepted)
+                  << " refined_cut=" << cleanup_stats.final_cut
                   << " refined_max_part_weight="
-                  << stats.final_max_part_weight
-                  << " refine_seconds=" << stats.seconds << '\n';
+                  << cleanup_stats.final_max_part_weight
+                  << " refine_seconds="
+                  << (stats.seconds + cleanup_stats.seconds)
+                  << " pair_candidates=" << pair_stats.candidates
+                  << " mutual_pairs=" << pair_stats.mutual_pairs
+                  << " pair_accepted=" << pair_stats.accepted
+                  << " pair_cut_before=" << pair_stats.cut_before
+                  << " pair_cut_after=" << pair_stats.cut_after
+                  << " pair_rollback=" << (pair_stats.rollback ? 1 : 0)
+                  << " cleanup_cut_after=" << cleanup_stats.final_cut << '\n';
         partition = std::move(projected);
     }
 
