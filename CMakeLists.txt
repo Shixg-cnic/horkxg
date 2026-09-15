@@ -113,5 +113,58 @@ set_target_properties(gpart_coarsen_initial_standard PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
+set(GPART_PARTITION_SOURCES
+    app/partition_main.cu
+    ${GPART_COARSEN_CORE_SOURCES}
+    src/refine.cu
+    src/uncoarsen.cu
+)
+
+function(add_gpart_partition target graph_definition)
+    add_executable(${target} ${GPART_PARTITION_SOURCES})
+    target_include_directories(${target} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_compile_definitions(${target} PRIVATE ${graph_definition})
+    target_compile_options(${target} PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native>
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3;-Xcompiler=-march=native>
+    )
+    target_link_libraries(${target} PRIVATE gpart_initial_partition)
+    set_target_properties(${target} PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+    )
+endfunction()
+
+add_gpart_partition(gpart_partition_standard GPART_STANDARD_GRAPH)
+add_gpart_partition(gpart_partition_big GPART_BIG_GRAPH)
+
+function(add_gpart_uncoarsen_test target graph_definition)
+    add_executable(${target}
+        tests/test_uncoarsen.cu
+        src/refine.cu
+        src/uncoarsen.cu
+        src/graph.cpp
+    )
+    target_include_directories(${target} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_compile_definitions(${target} PRIVATE ${graph_definition})
+    target_compile_options(${target} PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native>
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3;-Xcompiler=-march=native>
+    )
+    set_target_properties(${target} PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+    )
+endfunction()
+
+add_gpart_uncoarsen_test(
+    gpart_test_uncoarsen_standard GPART_STANDARD_GRAPH)
+add_gpart_uncoarsen_test(
+    gpart_test_uncoarsen_big GPART_BIG_GRAPH)
+
 enable_testing()
 add_test(NAME initial_partition_small COMMAND gpart_test_initial_partition)
+add_test(NAME uncoarsen_small_standard COMMAND gpart_test_uncoarsen_standard)
+add_test(NAME uncoarsen_small_big COMMAND gpart_test_uncoarsen_big)
