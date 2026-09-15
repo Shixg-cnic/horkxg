@@ -10,10 +10,44 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_ARCHITECTURES 90 CACHE STRING "CUDA architectures")
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 
-set(GPART_COARSEN_SOURCES
-    app/coarsen_main.cu
+set(GPART_METIS_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/../sotas/Jet-Partitioner/dependencies/install/metis"
+    CACHE PATH "Existing METIS installation used by initial partitioning"
+)
+find_path(GPART_METIS_INCLUDE_DIR metis.h
+    HINTS "${GPART_METIS_ROOT}/include"
+)
+find_library(GPART_METIS_LIBRARY metis
+    HINTS "${GPART_METIS_ROOT}/lib"
+)
+find_library(GPART_GKLIB_LIBRARY GKlib
+    HINTS "${GPART_METIS_ROOT}/lib"
+)
+if(NOT GPART_METIS_INCLUDE_DIR OR NOT GPART_METIS_LIBRARY OR
+   NOT GPART_GKLIB_LIBRARY)
+    message(FATAL_ERROR
+        "Existing METIS was not found. Checked root: ${GPART_METIS_ROOT}; "
+        "header=${GPART_METIS_INCLUDE_DIR}; library=${GPART_METIS_LIBRARY}; "
+        "GKlib=${GPART_GKLIB_LIBRARY}")
+endif()
+message(STATUS "METIS header: ${GPART_METIS_INCLUDE_DIR}/metis.h")
+message(STATUS "METIS library: ${GPART_METIS_LIBRARY}")
+message(STATUS "METIS GKlib dependency: ${GPART_GKLIB_LIBRARY}")
+
+add_library(METIS::METIS SHARED IMPORTED)
+set_target_properties(METIS::METIS PROPERTIES
+    IMPORTED_LOCATION "${GPART_METIS_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${GPART_METIS_INCLUDE_DIR}"
+    INTERFACE_LINK_LIBRARIES "${GPART_GKLIB_LIBRARY}"
+)
+
+set(GPART_COARSEN_CORE_SOURCES
     src/coarsen.cu
     src/graph.cpp
+)
+set(GPART_COARSEN_SOURCES
+    app/coarsen_main.cu
+    ${GPART_COARSEN_CORE_SOURCES}
 )
 
 # graph.cpp owns host/device graph transfer helpers and therefore needs the
@@ -37,3 +71,47 @@ endfunction()
 
 add_gpart_coarsen(gpart_coarsen_standard GPART_STANDARD_GRAPH)
 add_gpart_coarsen(gpart_coarsen_big GPART_BIG_GRAPH)
+
+add_library(gpart_initial_partition STATIC
+    src/initial_partition.cpp
+)
+target_include_directories(gpart_initial_partition PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}/cccl
+)
+target_link_libraries(gpart_initial_partition PUBLIC METIS::METIS)
+target_compile_options(gpart_initial_partition PRIVATE -O3 -march=native)
+
+add_executable(gpart_test_initial_partition
+    tests/test_initial_partition.cpp
+)
+target_link_libraries(gpart_test_initial_partition PRIVATE
+    gpart_initial_partition
+)
+
+# Temporary in-memory integration driver. It deliberately does not read or
+# write a new standalone hierarchy format and performs no uncoarsening.
+add_executable(gpart_coarsen_initial_standard
+    app/coarsen_initial_main.cu
+    ${GPART_COARSEN_CORE_SOURCES}
+)
+target_include_directories(gpart_coarsen_initial_standard PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_compile_definitions(gpart_coarsen_initial_standard PRIVATE
+    GPART_STANDARD_GRAPH
+)
+target_compile_options(gpart_coarsen_initial_standard PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-O3;-march=native>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3;-Xcompiler=-march=native>
+)
+target_link_libraries(gpart_coarsen_initial_standard PRIVATE
+    gpart_initial_partition
+)
+set_target_properties(gpart_coarsen_initial_standard PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+)
+
+enable_testing()
+add_test(NAME initial_partition_small COMMAND gpart_test_initial_partition)
