@@ -539,14 +539,10 @@ std::vector<std::uint64_t> validate_and_measure_partition(
 }  // namespace
 
 template <typename Types>
-class RefineDeviceContext {
+class RefineWorkspace {
 public:
     using VertexT = typename Types::VertexT;
-    const WeightedGraph<Types>& host_graph;
-    DeviceWeightedGraph<Types> graph;
-    thrust::device_vector<VertexT> partition;
     thrust::device_vector<VertexT> previous_partition;
-    thrust::device_vector<unsigned long long> part_weights;
     thrust::device_vector<unsigned long long> previous_part_weights;
     thrust::device_vector<unsigned long long> cut_counter;
     thrust::device_vector<RefineAdmissionKey> proposal_keys;
@@ -565,6 +561,65 @@ public:
     thrust::device_vector<std::uint64_t> prefix_weights;
     thrust::device_vector<std::int32_t> accepted_flags;
     thrust::device_vector<std::uint8_t> radix_temp;
+    double resize_seconds = 0.0;
+
+    template <typename T>
+    void grow(thrust::device_vector<T>& buffer, std::size_t required) {
+        if (buffer.size() < required) {
+            const auto start = std::chrono::steady_clock::now();
+            buffer.resize(required);
+            resize_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start).count();
+        }
+    }
+
+    void initialize(std::size_t vertices, std::size_t parts) {
+        grow(previous_partition, vertices);
+        grow(previous_part_weights, parts);
+        grow(cut_counter, 1);
+        grow(proposal_keys, vertices);
+        grow(compact_keys, vertices);
+    }
+
+    void reserve_radix(std::size_t bytes) { grow(radix_temp, bytes); }
+
+    void reserve_admission(std::size_t count) {
+        grow(ordered_targets, count);
+        grow(ordered_weights, count);
+        grow(prefix_weights, count);
+        grow(accepted_flags, count);
+    }
+
+    void reserve_plain_sorted(std::size_t count) {
+        grow(sorted_keys, count);
+        reserve_admission(count);
+    }
+
+    void reserve_pair_vertices(std::size_t count) {
+        grow(pair_targets, count);
+        grow(signed_gains, count);
+        grow(best_partners, count);
+        grow(best_pair_gains, count);
+        grow(candidate_counts, count);
+        grow(pair_proposal_keys, count);
+        grow(pair_compact_keys, count);
+    }
+
+    void reserve_pair_sorted(std::size_t count) {
+        grow(pair_sorted_keys, count);
+        reserve_admission(count);
+    }
+};
+
+template <typename Types>
+class RefineDeviceContext {
+public:
+    using VertexT = typename Types::VertexT;
+    const WeightedGraph<Types>& host_graph;
+    DeviceWeightedGraph<Types> graph;
+    thrust::device_vector<VertexT> partition;
+    thrust::device_vector<unsigned long long> part_weights;
+    RefineWorkspace<Types>& workspace;
     std::vector<std::uint64_t> host_part_weights;
     std::uint64_t capacity;
     std::int64_t n;
@@ -574,8 +629,9 @@ public:
     RefineDeviceContext(
         const WeightedGraph<Types>& input,
         const std::vector<VertexT>& labels,
-        const RefineOptions& options)
-        : host_graph(input),
+        const RefineOptions& options,
+        RefineWorkspace<Types>& temporary)
+        : host_graph(input), workspace(temporary),
           n(input.vertices()),
           vertex_blocks(static_cast<int>((n + 255) / 256)),
           warp_blocks(static_cast<int>(
@@ -616,11 +672,13 @@ public:
         thrust::device_vector<VertexT>&& device_partition,
         thrust::device_vector<unsigned long long>&& device_part_weights,
         std::vector<std::uint64_t> measured_part_weights,
-        const RefineOptions& options)
+        const RefineOptions& options,
+        RefineWorkspace<Types>& temporary)
         : host_graph(input),
           graph(std::move(device_graph)),
           partition(std::move(device_partition)),
           part_weights(std::move(device_part_weights)),
+          workspace(temporary),
           host_part_weights(std::move(measured_part_weights)),
           n(input.vertices()),
           vertex_blocks(static_cast<int>((n + 255) / 256)),
@@ -647,53 +705,17 @@ public:
     }
 
     void initialize_buffers() {
-        previous_partition.resize(static_cast<std::size_t>(n));
-        previous_part_weights.resize(part_weights.size());
-        cut_counter.resize(1);
-        proposal_keys.resize(static_cast<std::size_t>(n));
-        compact_keys.resize(static_cast<std::size_t>(n));
+        workspace.initialize(static_cast<std::size_t>(n), part_weights.size());
     }
 
     std::uint64_t cut() {
-        return device_cut_value(graph, partition, cut_counter);
+        return device_cut_value(graph, partition, workspace.cut_counter);
     }
 
     void sync_part_weights() {
         thrust::copy(
             part_weights.begin(), part_weights.end(),
             host_part_weights.begin());
-    }
-
-    void reserve_radix(std::size_t bytes) {
-        if (radix_temp.size() < bytes) radix_temp.resize(bytes);
-    }
-
-    void reserve_admission(std::size_t count) {
-        if (ordered_targets.size() < count) ordered_targets.resize(count);
-        if (ordered_weights.size() < count) ordered_weights.resize(count);
-        if (prefix_weights.size() < count) prefix_weights.resize(count);
-        if (accepted_flags.size() < count) accepted_flags.resize(count);
-    }
-
-    void reserve_plain_sorted(std::size_t count) {
-        if (sorted_keys.size() < count) sorted_keys.resize(count);
-        reserve_admission(count);
-    }
-
-    void reserve_pair_vertices() {
-        const auto count = static_cast<std::size_t>(n);
-        pair_targets.resize(count);
-        signed_gains.resize(count);
-        best_partners.resize(count);
-        best_pair_gains.resize(count);
-        candidate_counts.resize(count);
-        pair_proposal_keys.resize(count);
-        pair_compact_keys.resize(count);
-    }
-
-    void reserve_pair_sorted(std::size_t count) {
-        if (pair_sorted_keys.size() < count) pair_sorted_keys.resize(count);
-        reserve_admission(count);
     }
 
     void export_partition(std::vector<VertexT>& labels) {
@@ -709,17 +731,17 @@ RefineStats run_plain_refinement(
     const auto start = std::chrono::steady_clock::now();
     auto& device_graph = context.graph;
     auto& device_partition = context.partition;
-    auto& previous_partition = context.previous_partition;
+    auto& previous_partition = context.workspace.previous_partition;
     auto& part_weights = context.part_weights;
-    auto& previous_part_weights = context.previous_part_weights;
-    auto& proposal_keys = context.proposal_keys;
-    auto& compact_keys = context.compact_keys;
-    auto& sorted_keys = context.sorted_keys;
-    auto& ordered_targets = context.ordered_targets;
-    auto& ordered_weights = context.ordered_weights;
-    auto& prefix_weights = context.prefix_weights;
-    auto& accepted_flags = context.accepted_flags;
-    auto& radix_temp = context.radix_temp;
+    auto& previous_part_weights = context.workspace.previous_part_weights;
+    auto& proposal_keys = context.workspace.proposal_keys;
+    auto& compact_keys = context.workspace.compact_keys;
+    auto& sorted_keys = context.workspace.sorted_keys;
+    auto& ordered_targets = context.workspace.ordered_targets;
+    auto& ordered_weights = context.workspace.ordered_weights;
+    auto& prefix_weights = context.workspace.prefix_weights;
+    auto& accepted_flags = context.workspace.accepted_flags;
+    auto& radix_temp = context.workspace.radix_temp;
     auto& host_part_weights = context.host_part_weights;
     const auto capacity = context.capacity;
     const auto n = context.n;
@@ -753,13 +775,13 @@ RefineStats run_plain_refinement(
             thrust::raw_pointer_cast(proposal_keys.data()));
         CUDA_CHECK(cudaGetLastError());
         const auto compact_end = thrust::copy_if(
-            thrust::device, proposal_keys.begin(), proposal_keys.end(),
+            thrust::device, proposal_keys.begin(), proposal_keys.begin() + n,
             compact_keys.begin(), ValidRefineProposal{});
         const auto proposal_count = static_cast<std::int64_t>(
             compact_end - compact_keys.begin());
         stats.proposals += static_cast<std::uint64_t>(proposal_count);
         if (proposal_count == 0) break;
-        context.reserve_plain_sorted(
+        context.workspace.reserve_plain_sorted(
             static_cast<std::size_t>(proposal_count));
 
         std::size_t radix_bytes = 0;
@@ -769,7 +791,7 @@ RefineStats run_plain_refinement(
             thrust::raw_pointer_cast(sorted_keys.data()),
             static_cast<int>(proposal_count),
             RefineAdmissionKeyDecomposer{}));
-        context.reserve_radix(radix_bytes);
+        context.workspace.reserve_radix(radix_bytes);
         auto call_bytes = radix_bytes;
         CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
             thrust::raw_pointer_cast(radix_temp.data()), call_bytes,
@@ -820,10 +842,11 @@ RefineStats run_plain_refinement(
         const auto next_cut = device_cut();
         if (next_cut > current_cut) {
             thrust::copy(
-                previous_partition.begin(), previous_partition.end(),
+                previous_partition.begin(), previous_partition.begin() + n,
                 device_partition.begin());
             thrust::copy(
-                previous_part_weights.begin(), previous_part_weights.end(),
+                previous_part_weights.begin(),
+                previous_part_weights.begin() + part_weights.size(),
                 part_weights.begin());
             break;
         }
@@ -874,9 +897,9 @@ PairRefineStats run_pair_escape(
 
     auto& device_graph = context.graph;
     auto& device_partition = context.partition;
-    auto& previous_partition = context.previous_partition;
+    auto& previous_partition = context.workspace.previous_partition;
     auto& part_weights = context.part_weights;
-    auto& previous_part_weights = context.previous_part_weights;
+    auto& previous_part_weights = context.workspace.previous_part_weights;
     const auto n = context.n;
     const auto vertex_blocks = context.vertex_blocks;
     const auto warp_blocks = context.warp_blocks;
@@ -891,9 +914,9 @@ PairRefineStats run_pair_escape(
     PairRefineStats stats;
     stats.cut_before = device_cut();
     stats.cut_after = stats.cut_before;
-    context.reserve_pair_vertices();
-    auto& targets = context.pair_targets;
-    auto& signed_gains = context.signed_gains;
+    context.workspace.reserve_pair_vertices(static_cast<std::size_t>(n));
+    auto& targets = context.workspace.pair_targets;
+    auto& signed_gains = context.workspace.signed_gains;
     const auto tie_salt = options.seed ^
         (static_cast<std::uint32_t>(level) * 0x9e3779b9U) ^ 0x27d4eb2dU;
     constexpr std::size_t shared_bytes =
@@ -909,9 +932,9 @@ PairRefineStats run_pair_escape(
         thrust::raw_pointer_cast(signed_gains.data()));
     CUDA_CHECK(cudaGetLastError());
 
-    auto& best_partners = context.best_partners;
-    auto& best_pair_gains = context.best_pair_gains;
-    auto& candidate_counts = context.candidate_counts;
+    auto& best_partners = context.workspace.best_partners;
+    auto& best_pair_gains = context.workspace.best_pair_gains;
+    auto& candidate_counts = context.workspace.candidate_counts;
     pair_partner_kernel<<<vertex_blocks, 256>>>(
         n,
         thrust::raw_pointer_cast(device_graph.offsets.data()),
@@ -925,15 +948,15 @@ PairRefineStats run_pair_escape(
         thrust::raw_pointer_cast(candidate_counts.data()));
     CUDA_CHECK(cudaGetLastError());
     const auto directed_candidates = thrust::reduce(
-        candidate_counts.begin(), candidate_counts.end(), std::uint64_t{0});
+        candidate_counts.begin(), candidate_counts.begin() + n, std::uint64_t{0});
     if ((directed_candidates & 1ULL) != 0) {
         throw std::runtime_error("pair candidates are not symmetric");
     }
     stats.candidates = directed_candidates / 2;
 
-    auto& proposal_keys = context.pair_proposal_keys;
-    auto& compact_keys = context.pair_compact_keys;
-    auto& sorted_keys = context.pair_sorted_keys;
+    auto& proposal_keys = context.workspace.pair_proposal_keys;
+    auto& compact_keys = context.workspace.pair_compact_keys;
+    auto& sorted_keys = context.workspace.pair_sorted_keys;
     mutual_pair_proposal_kernel<<<vertex_blocks, 256>>>(
         n,
         thrust::raw_pointer_cast(device_partition.data()),
@@ -944,32 +967,32 @@ PairRefineStats run_pair_escape(
         thrust::raw_pointer_cast(proposal_keys.data()));
     CUDA_CHECK(cudaGetLastError());
     const auto compact_end = thrust::copy_if(
-        thrust::device, proposal_keys.begin(), proposal_keys.end(),
+        thrust::device, proposal_keys.begin(), proposal_keys.begin() + n,
         compact_keys.begin(), ValidPairProposal{});
     const auto pair_count = static_cast<std::int64_t>(
         compact_end - compact_keys.begin());
     stats.mutual_pairs = static_cast<std::uint64_t>(pair_count);
 
     if (pair_count > 0) {
-        context.reserve_pair_sorted(static_cast<std::size_t>(pair_count));
+        context.workspace.reserve_pair_sorted(static_cast<std::size_t>(pair_count));
         std::size_t radix_bytes = 0;
         CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
             nullptr, radix_bytes,
             thrust::raw_pointer_cast(compact_keys.data()),
             thrust::raw_pointer_cast(sorted_keys.data()),
             static_cast<int>(pair_count), PairAdmissionKeyDecomposer{}));
-        context.reserve_radix(radix_bytes);
+        context.workspace.reserve_radix(radix_bytes);
         auto call_bytes = radix_bytes;
         CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
-            thrust::raw_pointer_cast(context.radix_temp.data()), call_bytes,
+            thrust::raw_pointer_cast(context.workspace.radix_temp.data()), call_bytes,
             thrust::raw_pointer_cast(compact_keys.data()),
             thrust::raw_pointer_cast(sorted_keys.data()),
             static_cast<int>(pair_count), PairAdmissionKeyDecomposer{}));
 
-        auto& ordered_targets = context.ordered_targets;
-        auto& ordered_weights = context.ordered_weights;
-        auto& prefix_weights = context.prefix_weights;
-        auto& accepted_flags = context.accepted_flags;
+        auto& ordered_targets = context.workspace.ordered_targets;
+        auto& ordered_weights = context.workspace.ordered_weights;
+        auto& prefix_weights = context.workspace.prefix_weights;
+        auto& accepted_flags = context.workspace.accepted_flags;
         const int pair_blocks = static_cast<int>((pair_count + 255) / 256);
         decode_pair_proposals_kernel<<<pair_blocks, 256>>>(
             pair_count, thrust::raw_pointer_cast(sorted_keys.data()),
@@ -1010,10 +1033,11 @@ PairRefineStats run_pair_escape(
             if (stats.cut_after > stats.cut_before) {
                 stats.rollback = true;
                 thrust::copy(
-                    previous_partition.begin(), previous_partition.end(),
+                    previous_partition.begin(), previous_partition.begin() + n,
                     device_partition.begin());
                 thrust::copy(
-                    previous_part_weights.begin(), previous_part_weights.end(),
+                    previous_part_weights.begin(),
+                    previous_part_weights.begin() + part_weights.size(),
                     part_weights.begin());
             }
         }
@@ -1028,7 +1052,8 @@ void refine_partition(
     std::vector<typename Types::VertexT>& partition,
     const RefineOptions& options,
     RefineStats* output_stats) {
-    RefineDeviceContext<Types> context(graph, partition, options);
+    RefineWorkspace<Types> workspace;
+    RefineDeviceContext<Types> context(graph, partition, options, workspace);
     auto stats = run_plain_refinement(context, options, options.max_rounds);
     context.export_partition(partition);
     if (output_stats != nullptr) *output_stats = stats;
@@ -1041,7 +1066,8 @@ void coordinated_pair_escape(
     const RefineOptions& options,
     int level,
     PairRefineStats* output_stats) {
-    RefineDeviceContext<Types> context(graph, partition, options);
+    RefineWorkspace<Types> workspace;
+    RefineDeviceContext<Types> context(graph, partition, options, workspace);
     auto stats = run_pair_escape(context, options, level);
     context.export_partition(partition);
     if (output_stats != nullptr) *output_stats = stats;
@@ -1057,6 +1083,7 @@ DeviceUncoarsenResult<Types> refine_hierarchy_device(
         hierarchy.fine_to_coarse.size() + 1 != hierarchy.levels.size()) {
         throw std::invalid_argument("resident refinement requires a complete hierarchy");
     }
+    RefineWorkspace<Types> workspace;
     const auto& coarsest = hierarchy.levels.back();
     std::uint64_t total_weight = 0;
     auto current_host_weights = validate_and_measure_partition(
@@ -1069,12 +1096,13 @@ DeviceUncoarsenResult<Types> refine_hierarchy_device(
         current_host_weights.begin(), current_host_weights.end());
     double pending_graph_h2d = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - initial_h2d_start).count();
-    thrust::device_vector<unsigned long long> cut_counter(1);
+    workspace.grow(workspace.cut_counter, 1);
+    auto& cut_counter = workspace.cut_counter;
 
     DeviceUncoarsenResult<Types> result;
     result.levels.reserve(hierarchy.levels.size() - 1);
-    std::uint64_t last_cut = device_cut_value(
-        current_graph, current_partition, cut_counter);
+    std::uint64_t last_cut = hierarchy.levels.size() == 1
+        ? device_cut_value(current_graph, current_partition, cut_counter) : 0;
 
     for (std::size_t coarse_level = hierarchy.levels.size() - 1;
          coarse_level > 0; --coarse_level) {
@@ -1092,6 +1120,8 @@ DeviceUncoarsenResult<Types> refine_hierarchy_device(
             }
         }
 
+        const auto workspace_start = result.levels.empty()
+            ? 0.0 : workspace.resize_seconds;
         RefineLevelResult report;
         report.level = fine_level;
         report.vertices = fine.vertices();
@@ -1118,18 +1148,17 @@ DeviceUncoarsenResult<Types> refine_hierarchy_device(
         report.timings.projection_gpu_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - projection_start).count();
 
-        const auto verification_start = std::chrono::steady_clock::now();
         thrust::device_vector<unsigned long long> fine_part_weights;
-        device_part_weights(
-            fine_graph, fine_partition, fine_part_weights, options.parts);
-        std::vector<std::uint64_t> projected_weights(
-            static_cast<std::size_t>(options.parts));
-        thrust::copy(
-            fine_part_weights.begin(), fine_part_weights.end(),
-            projected_weights.begin());
-        report.projection_cut = device_cut_value(
-            fine_graph, fine_partition, cut_counter);
+        auto projected_weights = current_host_weights;
         if (options.strict_verify) {
+            const auto verification_start = std::chrono::steady_clock::now();
+            device_part_weights(
+                fine_graph, fine_partition, fine_part_weights, options.parts);
+            thrust::copy(
+                fine_part_weights.begin(), fine_part_weights.end(),
+                projected_weights.begin());
+            report.projection_cut = device_cut_value(
+                fine_graph, fine_partition, cut_counter);
             const auto coarse_cut = device_cut_value(
                 current_graph, current_partition, cut_counter);
             std::vector<std::uint64_t> coarse_weights(
@@ -1142,6 +1171,11 @@ DeviceUncoarsenResult<Types> refine_hierarchy_device(
                 throw std::runtime_error(
                     "GPU projection failed cut or part-weight preservation");
             }
+            report.timings.verification_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - verification_start).count();
+        } else {
+            // Projection preserves part weights; capacity needs no rescan.
+            fine_part_weights = std::move(current_part_weights);
         }
         report.projection_max_part_weight = *std::max_element(
             projected_weights.begin(), projected_weights.end());
@@ -1151,25 +1185,31 @@ DeviceUncoarsenResult<Types> refine_hierarchy_device(
         report.projection_imbalance = projected_total == 0 ? 0.0 :
             static_cast<double>(report.projection_max_part_weight) *
             options.parts / static_cast<double>(projected_total);
-        report.timings.verification_seconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - verification_start).count();
 
-        const auto context_start = std::chrono::steady_clock::now();
         RefineDeviceContext<Types> context(
             fine, std::move(fine_graph), std::move(fine_partition),
-            std::move(fine_part_weights), projected_weights, options);
-        report.timings.graph_h2d_seconds += std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - context_start).count();
+            std::move(fine_part_weights), projected_weights, options, workspace);
+        auto resize_before_stage = workspace.resize_seconds;
         report.plain = run_plain_refinement(
             context, options, options.max_rounds);
-        report.timings.plain_seconds = report.plain.seconds;
+        if (!options.strict_verify) {
+            report.projection_cut = report.plain.initial_cut;
+        }
+        report.timings.plain_seconds = report.plain.seconds -
+            (workspace.resize_seconds - resize_before_stage);
+        resize_before_stage = workspace.resize_seconds;
         const auto pair_start = std::chrono::steady_clock::now();
         report.pair = run_pair_escape(
             context, options, static_cast<int>(fine_level));
         report.timings.pair_seconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - pair_start).count();
+            std::chrono::steady_clock::now() - pair_start).count() -
+            (workspace.resize_seconds - resize_before_stage);
+        resize_before_stage = workspace.resize_seconds;
         report.cleanup = run_plain_refinement(context, options, 1);
-        report.timings.cleanup_seconds = report.cleanup.seconds;
+        report.timings.cleanup_seconds = report.cleanup.seconds -
+            (workspace.resize_seconds - resize_before_stage);
+        report.timings.workspace_resize_seconds =
+            workspace.resize_seconds - workspace_start;
         last_cut = report.cleanup.final_cut;
         current_host_weights = context.host_part_weights;
         current_graph = std::move(context.graph);

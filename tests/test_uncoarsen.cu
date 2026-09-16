@@ -108,6 +108,12 @@ int main() {
         options.strict_verify = true;
         const auto final_partition = gpart::uncoarsen(
             hierarchy, coarse_partition, options);
+        auto production_options = options;
+        production_options.strict_verify = false;
+        require(
+            gpart::uncoarsen(hierarchy, coarse_partition, production_options) ==
+                final_partition,
+            "production and strict partitions differ");
         require(final_partition.size() == 4, "final partition length is wrong");
         for (const auto part : final_partition) {
             require(part >= 0 && part < 2, "final part id is invalid");

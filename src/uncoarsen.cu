@@ -77,6 +77,7 @@ std::vector<typename Types::VertexT> uncoarsen(
                   << " pair_rollback=" << (pair_stats.rollback ? 1 : 0)
                   << " cleanup_cut_after=" << cleanup_stats.final_cut
                   << " graph_h2d_seconds=" << timings.graph_h2d_seconds
+                  << " workspace_resize_seconds=" << timings.workspace_resize_seconds
                   << " projection_gpu_seconds="
                   << timings.projection_gpu_seconds
                   << " plain_seconds=" << timings.plain_seconds

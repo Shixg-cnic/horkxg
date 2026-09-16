@@ -36,6 +36,7 @@ struct PairRefineStats {
 };
 
 struct RefineLevelTimings {
+    double workspace_resize_seconds = 0.0;
     double graph_h2d_seconds = 0.0;
     double projection_gpu_seconds = 0.0;
     double plain_seconds = 0.0;

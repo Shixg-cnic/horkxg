@@ -1593,8 +1593,7 @@ Hierarchy<Types> coarsen(
     const WeightedGraph<Types>& graph, const CoarsenOptions& options) {
     using VertexT = typename Types::VertexT;
     const bool diagnostics = std::getenv("SCLP_DIAGNOSTICS") != nullptr;
-    const bool verify = options.strict_verify ||
-                        std::getenv("SCLP_VERIFY") != nullptr;
+    const bool verify = options.strict_verify;
     const auto host_graph_build_start = std::chrono::steady_clock::now();
     Hierarchy<Types> hierarchy;
     hierarchy.levels.push_back(graph);
@@ -1606,13 +1605,6 @@ Hierarchy<Types> coarsen(
         validate_weighted_csr(hierarchy.levels.front(), true);
     } else {
         validate_weighted_shape(hierarchy.levels.front(), true);
-        std::vector<VertexT> labels(
-            static_cast<std::size_t>(hierarchy.levels.front().vertices()));
-        for (std::int64_t v = 0; v < hierarchy.levels.front().vertices(); ++v) {
-            labels[static_cast<std::size_t>(v)] =
-                static_cast<VertexT>((v * 2654435761ULL + 17) % 23);
-        }
-        (void)host_cut(hierarchy.levels.front(), labels);
     }
     const auto input_verify_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - input_verify_start).count();
