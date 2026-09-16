@@ -1,6 +1,7 @@
 #pragma once
 
 #include "graph.hpp"
+#include "hierarchy.hpp"
 
 #include <cstdint>
 #include <vector>
@@ -34,6 +35,38 @@ struct PairRefineStats {
     bool rollback = false;
 };
 
+struct RefineLevelTimings {
+    double graph_h2d_seconds = 0.0;
+    double projection_gpu_seconds = 0.0;
+    double plain_seconds = 0.0;
+    double pair_seconds = 0.0;
+    double cleanup_seconds = 0.0;
+    double verification_seconds = 0.0;
+};
+
+struct RefineLevelResult {
+    std::size_t level = 0;
+    std::int64_t vertices = 0;
+    std::int64_t edge_entries = 0;
+    std::uint64_t projection_cut = 0;
+    std::uint64_t projection_max_part_weight = 0;
+    double projection_imbalance = 0.0;
+    RefineStats plain;
+    PairRefineStats pair;
+    RefineStats cleanup;
+    RefineLevelTimings timings;
+};
+
+template <typename Types>
+struct DeviceUncoarsenResult {
+    std::vector<typename Types::VertexT> partition;
+    std::vector<RefineLevelResult> levels;
+    std::vector<std::uint64_t> final_part_weights;
+    std::uint64_t final_cut = 0;
+    std::uint64_t total_edge_weight = 0;
+    double final_d2h_seconds = 0.0;
+};
+
 template <typename Types>
 void refine_partition(
     const WeightedGraph<Types>& graph,
@@ -48,5 +81,11 @@ void coordinated_pair_escape(
     const RefineOptions& options,
     int level,
     PairRefineStats* stats = nullptr);
+
+template <typename Types>
+DeviceUncoarsenResult<Types> refine_hierarchy_device(
+    const Hierarchy<Types>& hierarchy,
+    const std::vector<typename Types::VertexT>& coarsest_partition,
+    const RefineOptions& options);
 
 }  // namespace gpart
