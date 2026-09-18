@@ -25,6 +25,7 @@
 #include <thrust/functional.h>
 #include <thrust/reduce.h>
 #include <thrust/scan.h>
+#include <thrust/transform_reduce.h>
 
 namespace gpart {
 namespace {
@@ -164,7 +165,10 @@ __global__ void pair_target_kernel(
     }
 }
 
-template <typename OffsetT, typename WeightT, typename VertexT>
+// Both paths reduce the same total ordering as the serial adjacency scan.
+// Low degree rows use four lanes; medium and hub rows use a full warp,
+// with hubs visited in coalesced, strided chunks.
+template <int Lanes, typename OffsetT, typename WeightT, typename VertexT>
 __global__ void pair_partner_kernel(
     std::int64_t n,
     const OffsetT* offsets,
@@ -177,9 +181,15 @@ __global__ void pair_partner_kernel(
     VertexT* best_partners,
     std::int64_t* best_pair_gains,
     std::uint64_t* candidate_counts) {
-    const auto vertex = static_cast<std::int64_t>(blockIdx.x) *
-        blockDim.x + threadIdx.x;
+    const int lane = threadIdx.x % Lanes;
+    const auto vertex = (static_cast<std::int64_t>(blockIdx.x) *
+        blockDim.x + threadIdx.x) / Lanes;
     if (vertex >= n) return;
+    const auto begin = static_cast<std::int64_t>(offsets[vertex]);
+    const auto end = static_cast<std::int64_t>(offsets[vertex + 1]);
+    if ((end - begin <= 32) != (Lanes == 4)) return;
+    const unsigned mask = (0xffffffffU >> (32 - Lanes)) <<
+        ((threadIdx.x & 31) / Lanes * Lanes);
     const auto source = partition[vertex];
     const auto target = targets[vertex];
     VertexT best_partner = VertexT{-1};
@@ -187,7 +197,7 @@ __global__ void pair_partner_kernel(
     std::uint32_t best_tie = 0;
     std::uint64_t candidates = 0;
     if (target != kInvalidTarget) {
-        for (auto edge = offsets[vertex]; edge < offsets[vertex + 1]; ++edge) {
+        for (auto edge = begin + lane; edge < end; edge += Lanes) {
             const auto neighbor = neighbors[edge];
             if (neighbor == vertex || partition[neighbor] != source ||
                 targets[neighbor] != target ||
@@ -212,9 +222,31 @@ __global__ void pair_partner_kernel(
             }
         }
     }
-    best_partners[vertex] = best_partner;
-    best_pair_gains[vertex] = best_gain;
-    candidate_counts[vertex] = candidates;
+    for (int delta = Lanes / 2; delta > 0; delta /= 2) {
+        const auto other_gain = static_cast<std::int64_t>(__shfl_down_sync(
+            mask, static_cast<long long>(best_gain), delta, Lanes));
+        const auto other_tie = __shfl_down_sync(mask, best_tie, delta, Lanes);
+        const auto other_partner = __shfl_down_sync(
+            mask, best_partner, delta, Lanes);
+        const auto other_count = static_cast<std::uint64_t>(__shfl_down_sync(
+            mask, static_cast<unsigned long long>(candidates), delta, Lanes));
+        if (lane + delta < Lanes) {
+            candidates += other_count;
+            if (other_gain > best_gain ||
+                (other_gain == best_gain &&
+                 (other_tie > best_tie ||
+                  (other_tie == best_tie && other_partner < best_partner)))) {
+                best_gain = other_gain;
+                best_tie = other_tie;
+                best_partner = other_partner;
+            }
+        }
+    }
+    if (lane == 0) {
+        best_partners[vertex] = best_partner;
+        best_pair_gains[vertex] = best_gain;
+        candidate_counts[vertex] = candidates;
+    }
 }
 
 template <typename WeightT, typename VertexT>
@@ -615,7 +647,6 @@ template <typename Types>
 class RefineDeviceContext {
 public:
     using VertexT = typename Types::VertexT;
-    const WeightedGraph<Types>& host_graph;
     DeviceWeightedGraph<Types> graph;
     thrust::device_vector<VertexT> partition;
     thrust::device_vector<unsigned long long> part_weights;
@@ -631,7 +662,7 @@ public:
         const std::vector<VertexT>& labels,
         const RefineOptions& options,
         RefineWorkspace<Types>& temporary)
-        : host_graph(input), workspace(temporary),
+        : workspace(temporary),
           n(input.vertices()),
           vertex_blocks(static_cast<int>((n + 255) / 256)),
           warp_blocks(static_cast<int>(
@@ -667,20 +698,18 @@ public:
     }
 
     RefineDeviceContext(
-        const WeightedGraph<Types>& input,
         DeviceWeightedGraph<Types>&& device_graph,
         thrust::device_vector<VertexT>&& device_partition,
         thrust::device_vector<unsigned long long>&& device_part_weights,
         std::vector<std::uint64_t> measured_part_weights,
         const RefineOptions& options,
         RefineWorkspace<Types>& temporary)
-        : host_graph(input),
-          graph(std::move(device_graph)),
+        : graph(std::move(device_graph)),
           partition(std::move(device_partition)),
           part_weights(std::move(device_part_weights)),
           workspace(temporary),
           host_part_weights(std::move(measured_part_weights)),
-          n(input.vertices()),
+          n(graph.vertices()),
           vertex_blocks(static_cast<int>((n + 255) / 256)),
           warp_blocks(static_cast<int>(
               (n + kWarpsPerBlock - 1) / kWarpsPerBlock)) {
@@ -869,17 +898,17 @@ RefineStats run_plain_refinement(
 }
 
 template <typename Types>
-PairRefineStats run_pair_escape(
-    RefineDeviceContext<Types>& context,
-    const RefineOptions& options,
-    int level) {
-    using VertexT = typename Types::VertexT;
-    const auto& graph = context.host_graph;
+void validate_pair_gain_range(const WeightedGraph<Types>& graph) {
+    constexpr auto signed_limit = static_cast<std::uint64_t>(
+        std::numeric_limits<std::int64_t>::max()) / 2;
+    constexpr auto max_weight = static_cast<std::uint64_t>(
+        std::numeric_limits<typename Types::WeightT>::max());
+    // A type/size bound proves exactly the old safety condition without
+    // touching edge data. Division avoids overflow in the bound itself.
+    if (graph.edge_weights.size() <= signed_limit / max_weight) return;
     std::uint64_t directed_weight = 0;
     for (const auto edge_weight : graph.edge_weights) {
         const auto weight = static_cast<std::uint64_t>(edge_weight);
-        const auto signed_limit = static_cast<std::uint64_t>(
-            std::numeric_limits<std::int64_t>::max()) / 2;
         if (weight > signed_limit ||
             directed_weight > signed_limit - weight) {
             throw std::overflow_error(
@@ -887,6 +916,55 @@ PairRefineStats run_pair_escape(
         }
         directed_weight += weight;
     }
+}
+
+struct PairWeightSum {
+    __host__ __device__ std::uint64_t operator()(std::uint64_t a, std::uint64_t b) const {
+        constexpr auto limit = std::uint64_t(INT64_MAX) / 2;
+        return a > limit || b > limit || a > limit - b ? limit + 1 : a + b;
+    }
+};
+
+template <typename Types>
+void validate_pair_gain_range(const DeviceWeightedGraph<Types>& graph) {
+    constexpr auto limit = std::uint64_t(INT64_MAX) / 2;
+    constexpr auto max_weight = std::numeric_limits<typename Types::WeightT>::max();
+    if (graph.edge_weights.size() <= limit / max_weight) return;
+    if (thrust::reduce(graph.edge_weights.begin(), graph.edge_weights.end(),
+                       std::uint64_t{0}, PairWeightSum{}) > limit) {
+        throw std::overflow_error("pair refinement signed gain range exceeded");
+    }
+}
+
+struct InvalidId {
+    std::int64_t bound;
+    template <typename T>
+    __host__ __device__ bool operator()(T id) const { return id < 0 || id >= bound; }
+};
+
+struct CheckedWeight {
+    std::uint64_t value;
+    bool overflow;
+    __host__ __device__ CheckedWeight(std::uint64_t v = 0) : value(v), overflow(false) {}
+};
+struct CheckedWeightAdd {
+    __host__ __device__ CheckedWeight operator()(CheckedWeight a, CheckedWeight b) const {
+        CheckedWeight out(a.value + b.value);
+        out.overflow = a.overflow || b.overflow || out.value < a.value;
+        return out;
+    }
+};
+struct ToCheckedWeight {
+    template <typename W>
+    __host__ __device__ CheckedWeight operator()(W weight) const { return CheckedWeight(weight); }
+};
+
+template <typename Types>
+PairRefineStats run_pair_escape(
+    RefineDeviceContext<Types>& context,
+    const RefineOptions& options,
+    int level) {
+    using VertexT = typename Types::VertexT;
 
     auto& host_part_weights = context.host_part_weights;
     const auto capacity = context.capacity;
@@ -935,7 +1013,19 @@ PairRefineStats run_pair_escape(
     auto& best_partners = context.workspace.best_partners;
     auto& best_pair_gains = context.workspace.best_pair_gains;
     auto& candidate_counts = context.workspace.candidate_counts;
-    pair_partner_kernel<<<vertex_blocks, 256>>>(
+    pair_partner_kernel<4><<<static_cast<int>((n + 63) / 64), 256>>>(
+        n,
+        thrust::raw_pointer_cast(device_graph.offsets.data()),
+        thrust::raw_pointer_cast(device_graph.neighbors.data()),
+        thrust::raw_pointer_cast(device_graph.edge_weights.data()),
+        thrust::raw_pointer_cast(device_partition.data()),
+        thrust::raw_pointer_cast(targets.data()),
+        thrust::raw_pointer_cast(signed_gains.data()), tie_salt,
+        thrust::raw_pointer_cast(best_partners.data()),
+        thrust::raw_pointer_cast(best_pair_gains.data()),
+        thrust::raw_pointer_cast(candidate_counts.data()));
+    CUDA_CHECK(cudaGetLastError());
+    pair_partner_kernel<32><<<warp_blocks, 256>>>(
         n,
         thrust::raw_pointer_cast(device_graph.offsets.data()),
         thrust::raw_pointer_cast(device_graph.neighbors.data()),
@@ -1066,6 +1156,7 @@ void coordinated_pair_escape(
     const RefineOptions& options,
     int level,
     PairRefineStats* output_stats) {
+    validate_pair_gain_range(graph);
     RefineWorkspace<Types> workspace;
     RefineDeviceContext<Types> context(graph, partition, options, workspace);
     auto stats = run_pair_escape(context, options, level);
@@ -1073,28 +1164,61 @@ void coordinated_pair_escape(
     if (output_stats != nullptr) *output_stats = stats;
 }
 
-template <typename Types>
-DeviceUncoarsenResult<Types> refine_hierarchy_device(
-    const Hierarchy<Types>& hierarchy,
-    const std::vector<typename Types::VertexT>& coarsest_partition,
+template <typename Types, bool Resident, typename H, typename P>
+DeviceUncoarsenResult<Types> refine_hierarchy_impl(
+    H& hierarchy, P&& coarsest_partition,
     const RefineOptions& options) {
     using VertexT = typename Types::VertexT;
+    if (options.parts < 2 || options.parts > 32 || options.max_rounds < 0 ||
+        options.max_rounds > 4 || !std::isfinite(options.imbalance_ratio) ||
+        options.imbalance_ratio < 1.0) {
+        throw std::invalid_argument("invalid refinement options");
+    }
     if (hierarchy.levels.empty() ||
         hierarchy.fine_to_coarse.size() + 1 != hierarchy.levels.size()) {
         throw std::invalid_argument("resident refinement requires a complete hierarchy");
     }
+    // Validate once before any refinement, including externally built
+    // hierarchies; do not assume their coarse edge weights are bounded by
+    // the original graph's weight sum.
+    for (std::size_t level = 0; level + 1 < hierarchy.levels.size(); ++level) {
+        validate_pair_gain_range(hierarchy.levels[level]);
+    }
     RefineWorkspace<Types> workspace;
-    const auto& coarsest = hierarchy.levels.back();
+    auto& coarsest = hierarchy.levels.back();
     std::uint64_t total_weight = 0;
-    auto current_host_weights = validate_and_measure_partition(
-        coarsest, coarsest_partition, options.parts, total_weight);
-
     const auto initial_h2d_start = std::chrono::steady_clock::now();
-    auto current_graph = make_device_weighted(coarsest);
-    thrust::device_vector<VertexT> current_partition = coarsest_partition;
-    thrust::device_vector<unsigned long long> current_part_weights(
-        current_host_weights.begin(), current_host_weights.end());
-    double pending_graph_h2d = std::chrono::duration<double>(
+    DeviceWeightedGraph<Types> current_graph;
+    thrust::device_vector<VertexT> current_partition;
+    thrust::device_vector<unsigned long long> current_part_weights;
+    std::vector<std::uint64_t> current_host_weights;
+    if constexpr (Resident) {
+        if (coarsest_partition.size() != static_cast<std::size_t>(coarsest.vertices()) ||
+            thrust::count_if(coarsest_partition.begin(), coarsest_partition.end(),
+                             InvalidId{options.parts}) != 0) {
+            throw std::invalid_argument("invalid coarsest device partition");
+        }
+        const auto sum = thrust::transform_reduce(coarsest.vertex_weights.begin(),
+            coarsest.vertex_weights.end(), ToCheckedWeight{}, CheckedWeight{}, CheckedWeightAdd{});
+        if (sum.overflow) throw std::overflow_error("refinement vertex weight sum overflow");
+        total_weight = sum.value;
+        current_graph = std::move(coarsest);
+        current_partition = std::move(coarsest_partition);
+        device_part_weights(current_graph, current_partition, current_part_weights, options.parts);
+        current_host_weights.resize(options.parts);
+        thrust::copy(current_part_weights.begin(), current_part_weights.end(), current_host_weights.begin());
+    } else {
+        current_host_weights = validate_and_measure_partition(
+            coarsest, coarsest_partition, options.parts, total_weight);
+        current_graph = make_device_weighted(coarsest);
+        current_partition = coarsest_partition;
+        current_part_weights.assign(current_host_weights.begin(), current_host_weights.end());
+    }
+    if (*std::max_element(current_host_weights.begin(), current_host_weights.end()) >
+        refinement_capacity(total_weight, options.parts, options.imbalance_ratio)) {
+        throw std::invalid_argument("initial refinement partition is imbalanced");
+    }
+    double pending_graph_h2d = Resident ? 0.0 : std::chrono::duration<double>(
         std::chrono::steady_clock::now() - initial_h2d_start).count();
     workspace.grow(workspace.cut_counter, 1);
     auto& cut_counter = workspace.cut_counter;
@@ -1107,16 +1231,20 @@ DeviceUncoarsenResult<Types> refine_hierarchy_device(
     for (std::size_t coarse_level = hierarchy.levels.size() - 1;
          coarse_level > 0; --coarse_level) {
         const auto fine_level = coarse_level - 1;
-        const auto& fine = hierarchy.levels[fine_level];
-        const auto& map = hierarchy.fine_to_coarse[fine_level];
+        auto& fine = hierarchy.levels[fine_level];
+        auto& map = hierarchy.fine_to_coarse[fine_level];
         if (map.size() != static_cast<std::size_t>(fine.vertices())) {
             throw std::invalid_argument("fine-to-coarse map has wrong length");
         }
-        for (const auto coarse_vertex : map) {
-            if (coarse_vertex < 0 ||
-                coarse_vertex >= hierarchy.levels[coarse_level].vertices()) {
-                throw std::invalid_argument(
-                    "fine-to-coarse map contains an invalid id");
+        if constexpr (Resident) {
+            if (thrust::count_if(map.begin(), map.end(), InvalidId{current_graph.vertices()}) != 0) {
+                throw std::invalid_argument("fine-to-coarse map contains an invalid id");
+            }
+        } else {
+            for (const auto coarse_vertex : map) {
+                if (coarse_vertex < 0 || coarse_vertex >= current_graph.vertices()) {
+                    throw std::invalid_argument("fine-to-coarse map contains an invalid id");
+                }
             }
         }
 
@@ -1127,20 +1255,27 @@ DeviceUncoarsenResult<Types> refine_hierarchy_device(
         report.vertices = fine.vertices();
         report.edge_entries = fine.edges();
         const auto graph_h2d_start = std::chrono::steady_clock::now();
-        auto fine_graph = make_device_weighted(fine);
-        thrust::device_vector<VertexT> device_map = map;
+        DeviceWeightedGraph<Types> fine_graph;
+        thrust::device_vector<VertexT> device_map;
+        if constexpr (Resident) {
+            fine_graph = std::move(fine);
+            device_map = std::move(map);
+        } else {
+            fine_graph = make_device_weighted(fine);
+            device_map = map;
+        }
         thrust::device_vector<VertexT> fine_partition(
-            static_cast<std::size_t>(fine.vertices()));
-        report.timings.graph_h2d_seconds = pending_graph_h2d +
+            static_cast<std::size_t>(report.vertices));
+        report.timings.graph_h2d_seconds = Resident ? 0.0 : pending_graph_h2d +
             std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - graph_h2d_start).count();
         pending_graph_h2d = 0.0;
 
         const auto projection_start = std::chrono::steady_clock::now();
         const int projection_blocks = static_cast<int>(
-            (fine.vertices() + 255) / 256);
+            (report.vertices + 255) / 256);
         project_partition_kernel<<<projection_blocks, 256>>>(
-            fine.vertices(), thrust::raw_pointer_cast(device_map.data()),
+            report.vertices, thrust::raw_pointer_cast(device_map.data()),
             thrust::raw_pointer_cast(current_partition.data()),
             thrust::raw_pointer_cast(fine_partition.data()));
         CUDA_CHECK(cudaGetLastError());
@@ -1187,7 +1322,7 @@ DeviceUncoarsenResult<Types> refine_hierarchy_device(
             options.parts / static_cast<double>(projected_total);
 
         RefineDeviceContext<Types> context(
-            fine, std::move(fine_graph), std::move(fine_partition),
+            std::move(fine_graph), std::move(fine_partition),
             std::move(fine_part_weights), projected_weights, options, workspace);
         auto resize_before_stage = workspace.resize_seconds;
         report.plain = run_plain_refinement(
@@ -1227,14 +1362,30 @@ DeviceUncoarsenResult<Types> refine_hierarchy_device(
         throw std::runtime_error("symmetric graph has odd directed edge weight");
     }
     result.total_edge_weight = directed_edge_weight / 2;
-    result.partition.resize(static_cast<std::size_t>(current_graph.vertices()));
-    const auto final_d2h_start = std::chrono::steady_clock::now();
-    thrust::copy(
-        current_partition.begin(), current_partition.end(),
-        result.partition.begin());
-    result.final_d2h_seconds = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - final_d2h_start).count();
+    if constexpr (Resident) {
+        result.device_partition = std::move(current_partition);
+    } else {
+        result.partition.resize(static_cast<std::size_t>(current_graph.vertices()));
+        const auto final_d2h_start = std::chrono::steady_clock::now();
+        thrust::copy(current_partition.begin(), current_partition.end(), result.partition.begin());
+        result.final_d2h_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - final_d2h_start).count();
+    }
     return result;
+}
+
+template <typename Types>
+DeviceUncoarsenResult<Types> refine_hierarchy_device(
+    const Hierarchy<Types>& hierarchy,
+    const std::vector<typename Types::VertexT>& partition, const RefineOptions& options) {
+    return refine_hierarchy_impl<Types, false>(hierarchy, partition, options);
+}
+
+template <typename Types>
+DeviceUncoarsenResult<Types> refine_hierarchy_device(
+    DeviceHierarchy<Types>& hierarchy,
+    thrust::device_vector<typename Types::VertexT>&& partition, const RefineOptions& options) {
+    return refine_hierarchy_impl<Types, true>(hierarchy, std::move(partition), options);
 }
 
 template void refine_partition<ActiveTypes>(
@@ -1254,6 +1405,9 @@ template DeviceUncoarsenResult<ActiveTypes>
 refine_hierarchy_device<ActiveTypes>(
     const Hierarchy<ActiveTypes>&,
     const std::vector<ActiveTypes::VertexT>&,
+    const RefineOptions&);
+template DeviceUncoarsenResult<ActiveTypes> refine_hierarchy_device<ActiveTypes>(
+    DeviceHierarchy<ActiveTypes>&, thrust::device_vector<ActiveTypes::VertexT>&&,
     const RefineOptions&);
 
 }  // namespace gpart

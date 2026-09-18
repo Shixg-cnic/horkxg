@@ -3,6 +3,8 @@
 #include "graph_types.hpp"
 #include "initial_partition.hpp"
 #include "uncoarsen.hpp"
+#include "check.hpp"
+#include <thrust/copy.h>
 
 #include <cstdint>
 #include <chrono>
@@ -36,12 +38,21 @@ int main(int argc, char** argv) {
         coarsen_options.parts = parts;
         coarsen_options.seed = seed;
         coarsen_options.strict_verify = verify;
+        // Jet-aligned boundary: initialized execution space and uploaded input.
+        // Retain the full wall clock separately; do not hide preparation costs.
+        const auto prepare_start = std::chrono::steady_clock::now();
+        if (verify) gpart::validate_weighted_csr(graph, true);
+        else gpart::validate_weighted_shape(graph, true);
+        auto device_graph = gpart::make_device_weighted(graph);
+        CUDA_CHECK(cudaDeviceSynchronize());
         const auto coarsen_start = std::chrono::steady_clock::now();
-        auto hierarchy = gpart::coarsen<Types>(graph, coarsen_options);
+        auto hierarchy = gpart::coarsen<Types>(std::move(device_graph), coarsen_options);
+        CUDA_CHECK(cudaDeviceSynchronize());
         const auto coarsen_end = std::chrono::steady_clock::now();
         const auto initial_start = std::chrono::steady_clock::now();
         auto coarse_partition = gpart::initial_partition<Types>(
             hierarchy.levels.back(), parts, imbalance);
+        CUDA_CHECK(cudaDeviceSynchronize());
         const auto initial_end = std::chrono::steady_clock::now();
         gpart::RefineOptions refine_options;
         refine_options.parts = parts;
@@ -50,9 +61,18 @@ int main(int argc, char** argv) {
         refine_options.max_rounds = 4;
         refine_options.strict_verify = verify;
         const auto uncoarsen_start = std::chrono::steady_clock::now();
-        const auto partition = gpart::uncoarsen<Types>(
-            hierarchy, coarse_partition, refine_options);
+        auto result = gpart::uncoarsen<Types>(
+            hierarchy, std::move(coarse_partition), refine_options);
+        CUDA_CHECK(cudaDeviceSynchronize());
         const auto uncoarsen_end = std::chrono::steady_clock::now();
+
+        hierarchy.levels.clear();
+        hierarchy.fine_to_coarse.clear();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        const auto free_end = std::chrono::steady_clock::now();
+        std::vector<typename Types::VertexT> partition(result.device_partition.size());
+        thrust::copy(result.device_partition.begin(), result.device_partition.end(), partition.begin());
+        const auto final_d2h_end = std::chrono::steady_clock::now();
 
         const auto output_start = std::chrono::steady_clock::now();
         std::ofstream output(argv[4], std::ios::binary | std::ios::trunc);
@@ -75,14 +95,18 @@ int main(int argc, char** argv) {
         const double output_seconds = std::chrono::duration<double>(
             output_end - output_start).count();
         const double algorithm_seconds =
-            coarsen_seconds + initial_seconds + uncoarsen_seconds;
-        // Host wall-clock stage times include each stage's existing logging.
-        // partition_total is an alias of algorithm_total (excludes file I/O).
+            std::chrono::duration<double>(free_end - coarsen_start).count();
+        // Jet-aligned total includes stage logging and hierarchy cleanup, but
+        // excludes input preparation, final partition download and file I/O.
         std::cout << std::setprecision(10)
                   << "partition_timing input_load_seconds=" << input_seconds
                   << " coarsen_seconds=" << coarsen_seconds
                   << " initial_partition_seconds=" << initial_seconds
                   << " uncoarsen_seconds=" << uncoarsen_seconds
+                  << " input_prepare_seconds=" << std::chrono::duration<double>(coarsen_start - prepare_start).count()
+                  << " hierarchy_free_seconds=" << std::chrono::duration<double>(free_end - uncoarsen_end).count()
+                  << " final_partition_d2h_seconds=" << std::chrono::duration<double>(final_d2h_end - free_end).count()
+                  << " timing_scope=jet_device_input_to_device_partition"
                   << " partition_output_seconds=" << output_seconds
                   << " partition_total_seconds=" << algorithm_seconds
                   << " algorithm_total_seconds=" << algorithm_seconds

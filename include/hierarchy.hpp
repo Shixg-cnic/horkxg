@@ -25,6 +25,18 @@ struct Hierarchy {
     std::size_t layer_count() const { return levels.size(); }
 };
 
+// Production ownership: retain each level and its projection map on device.
+// The host hierarchy remains available for export and compatibility tests.
+template <typename Types>
+struct DeviceHierarchy {
+    std::vector<DeviceWeightedGraph<Types>> levels;
+    std::vector<thrust::device_vector<typename Types::VertexT>> fine_to_coarse;
+    std::string stop_reason = "capacity_floor";
+    double hierarchy_loop_seconds = 0.0;
+    double snapshot_seconds = 0.0;
+    std::size_t layer_count() const { return levels.size(); }
+};
+
 // Preserve the existing Jet-compatible int32 on-disk representation. Runtime
 // graph widths are intentionally independent of the hierarchy file format.
 template <typename Types>

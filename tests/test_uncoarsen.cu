@@ -3,6 +3,7 @@
 #include "hierarchy.hpp"
 #include "refine.hpp"
 #include "uncoarsen.hpp"
+#include "coarsen.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -74,6 +75,19 @@ int main() {
         using Types = gpart::ActiveTypes;
         using VertexT = typename Types::VertexT;
         auto hierarchy = make_hierarchy<Types>();
+        // Both CSR validation paths must retain all rejection conditions.
+        for (int failure = 0; failure < 4; ++failure) {
+            auto invalid = hierarchy.levels.front();
+            if (failure == 0) invalid.neighbors[0] = -1;
+            if (failure == 1) invalid.neighbors[0] = invalid.vertices();
+            if (failure == 2) invalid.offsets[2] = 0;
+            if (failure == 3) invalid.neighbors[0] = 0;
+            bool rejected = false;
+            try { gpart::validate_weighted_shape(invalid, failure != 3); }
+            catch (const std::runtime_error&) { rejected = true; }
+            require(rejected, "CSR safety validation was lost");
+            if (failure == 3) gpart::validate_weighted_shape(invalid, true);
+        }
         const std::vector<VertexT> coarse_partition{VertexT{0}, VertexT{1}};
         const auto& map = hierarchy.fine_to_coarse.front();
         std::vector<VertexT> projected(map.size());
@@ -114,6 +128,57 @@ int main() {
             gpart::uncoarsen(hierarchy, coarse_partition, production_options) ==
                 final_partition,
             "production and strict partitions differ");
+        for (bool strict : {false, true}) {
+            gpart::DeviceHierarchy<Types> device_hierarchy;
+            for (const auto& level : hierarchy.levels)
+                device_hierarchy.levels.push_back(gpart::make_device_weighted(level));
+            for (const auto& mapping : hierarchy.fine_to_coarse)
+                device_hierarchy.fine_to_coarse.emplace_back(mapping);
+            thrust::device_vector<VertexT> device_labels = coarse_partition;
+            auto resident_options = options;
+            resident_options.strict_verify = strict;
+            auto result = gpart::uncoarsen(device_hierarchy, std::move(device_labels), resident_options);
+            std::vector<VertexT> labels(result.device_partition.size());
+            thrust::copy(result.device_partition.begin(), result.device_partition.end(), labels.begin());
+            require(labels == final_partition, "device hierarchy changed refinement");
+            require(result.partition.empty(), "resident path downloaded partition");
+            for (const auto& level : result.levels)
+                require(level.timings.graph_h2d_seconds == 0, "resident level uploaded graph");
+        }
+
+        // Exact level/map comparison, including the no-contraction case.
+        for (int n : {8, 4096}) {
+            gpart::WeightedGraph<Types> input;
+            input.vertex_weights.assign(n, 1);
+            input.offsets.push_back(0);
+            for (int v = 0; v < n; ++v) {
+                input.neighbors.push_back(v ^ 1);
+                input.edge_weights.push_back(1);
+                input.offsets.push_back(v + 1);
+            }
+            gpart::CoarsenOptions co;
+            co.strict_verify = true;
+            auto host_levels = gpart::coarsen(input, co);
+            for (bool strict : {false, true}) {
+                co.strict_verify = strict;
+                auto device_levels = gpart::coarsen(gpart::make_device_weighted(input), co);
+                require(host_levels.levels.size() == device_levels.levels.size(), "resident level count differs");
+                require(host_levels.stop_reason == device_levels.stop_reason, "resident stop reason differs");
+                if (!strict) require(device_levels.snapshot_seconds == 0, "production copied snapshots");
+                for (std::size_t l = 0; l < host_levels.levels.size(); ++l) {
+                    auto actual = gpart::copy_device_weighted(device_levels.levels[l]);
+                    const auto& expected = host_levels.levels[l];
+                    require(actual.offsets == expected.offsets && actual.neighbors == expected.neighbors &&
+                            actual.edge_weights == expected.edge_weights && actual.vertex_weights == expected.vertex_weights,
+                            "resident hierarchy CSR differs");
+                    if (l < host_levels.fine_to_coarse.size()) {
+                        std::vector<VertexT> map(device_levels.fine_to_coarse[l].size());
+                        thrust::copy(device_levels.fine_to_coarse[l].begin(), device_levels.fine_to_coarse[l].end(), map.begin());
+                        require(map == host_levels.fine_to_coarse[l], "resident hierarchy map differs");
+                    }
+                }
+            }
+        }
         require(final_partition.size() == 4, "final partition length is wrong");
         for (const auto part : final_partition) {
             require(part >= 0 && part < 2, "final part id is invalid");

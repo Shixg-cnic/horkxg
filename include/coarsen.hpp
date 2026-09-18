@@ -90,4 +90,10 @@ template <typename Types>
 Hierarchy<Types> coarsen(
     const WeightedGraph<Types>& graph, const CoarsenOptions& options);
 
+// Input is already validated/uploaded; allocation of coarsening workspace
+// remains inside this call and therefore inside the partition timing.
+template <typename Types>
+DeviceHierarchy<Types> coarsen(
+    DeviceWeightedGraph<Types>&& graph, const CoarsenOptions& options);
+
 }  // namespace gpart

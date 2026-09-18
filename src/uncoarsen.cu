@@ -36,10 +36,9 @@ double imbalance_of(
 
 }  // namespace
 
-template <typename Types>
-std::vector<typename Types::VertexT> uncoarsen(
-    const Hierarchy<Types>& hierarchy,
-    const std::vector<typename Types::VertexT>& coarsest_partition,
+template <typename Types, typename H, typename P>
+DeviceUncoarsenResult<Types> uncoarsen_impl(
+    H& hierarchy, P&& coarsest_partition,
     const RefineOptions& options) {
     const auto start = std::chrono::steady_clock::now();
     if (hierarchy.levels.empty() ||
@@ -47,7 +46,7 @@ std::vector<typename Types::VertexT> uncoarsen(
         throw std::invalid_argument("uncoarsen requires a complete hierarchy");
     }
     auto result = refine_hierarchy_device(
-        hierarchy, coarsest_partition, options);
+        hierarchy, std::forward<P>(coarsest_partition), options);
     for (const auto& level : result.levels) {
         const auto& stats = level.plain;
         const auto& pair_stats = level.pair;
@@ -103,12 +102,30 @@ std::vector<typename Types::VertexT> uncoarsen(
               << imbalance_of(result.final_part_weights, total_weight) << '\n'
               << "final_d2h_seconds=" << result.final_d2h_seconds << '\n'
               << "uncoarsen_total_seconds=" << seconds << '\n';
+    return result;
+}
+
+template <typename Types>
+std::vector<typename Types::VertexT> uncoarsen(
+    const Hierarchy<Types>& hierarchy,
+    const std::vector<typename Types::VertexT>& partition, const RefineOptions& options) {
+    auto result = uncoarsen_impl<Types>(hierarchy, partition, options);
     return std::move(result.partition);
+}
+
+template <typename Types>
+DeviceUncoarsenResult<Types> uncoarsen(
+    DeviceHierarchy<Types>& hierarchy,
+    thrust::device_vector<typename Types::VertexT>&& partition, const RefineOptions& options) {
+    return uncoarsen_impl<Types>(hierarchy, std::move(partition), options);
 }
 
 template std::vector<ActiveTypes::VertexT> uncoarsen<ActiveTypes>(
     const Hierarchy<ActiveTypes>&,
     const std::vector<ActiveTypes::VertexT>&,
+    const RefineOptions&);
+template DeviceUncoarsenResult<ActiveTypes> uncoarsen<ActiveTypes>(
+    DeviceHierarchy<ActiveTypes>&, thrust::device_vector<ActiveTypes::VertexT>&&,
     const RefineOptions&);
 
 }  // namespace gpart

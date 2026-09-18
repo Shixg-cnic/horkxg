@@ -61,6 +61,7 @@ struct RefineLevelResult {
 template <typename Types>
 struct DeviceUncoarsenResult {
     std::vector<typename Types::VertexT> partition;
+    thrust::device_vector<typename Types::VertexT> device_partition;
     std::vector<RefineLevelResult> levels;
     std::vector<std::uint64_t> final_part_weights;
     std::uint64_t final_cut = 0;
@@ -87,6 +88,12 @@ template <typename Types>
 DeviceUncoarsenResult<Types> refine_hierarchy_device(
     const Hierarchy<Types>& hierarchy,
     const std::vector<typename Types::VertexT>& coarsest_partition,
+    const RefineOptions& options);
+
+template <typename Types>
+DeviceUncoarsenResult<Types> refine_hierarchy_device(
+    DeviceHierarchy<Types>& hierarchy,
+    thrust::device_vector<typename Types::VertexT>&& coarsest_partition,
     const RefineOptions& options);
 
 }  // namespace gpart

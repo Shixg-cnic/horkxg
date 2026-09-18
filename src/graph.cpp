@@ -137,12 +137,24 @@ void validate_weighted_shape(
         if (begin > end) {
             throw std::runtime_error("weighted CSR offsets are not monotone");
         }
+    }
+    // Check neighbor bounds as one contiguous reduction. Keeping exceptions
+    // outside the loop permits SIMD, without dropping any CSR validation.
+    unsigned invalid_neighbor = 0;
+    const auto vertices = graph.vertices();
+    for (const auto u : graph.neighbors) {
+        invalid_neighbor |= static_cast<unsigned>(u < 0 || u >= vertices);
+    }
+    if (invalid_neighbor) {
+        throw std::runtime_error("weighted CSR contains an invalid neighbor");
+    }
+    if (allow_self_loops) return;
+    for (std::int64_t v = 0; v < graph.vertices(); ++v) {
+        const auto begin = graph.offsets[static_cast<std::size_t>(v)];
+        const auto end = graph.offsets[static_cast<std::size_t>(v + 1)];
         for (auto e = begin; e < end; ++e) {
             const auto u = graph.neighbors[static_cast<std::size_t>(e)];
-            if (u < 0 || u >= graph.vertices()) {
-                throw std::runtime_error("weighted CSR contains an invalid neighbor");
-            }
-            if (!allow_self_loops && u == v) {
+            if (u == v) {
                 throw std::runtime_error("contracted graph contains a self loop");
             }
         }

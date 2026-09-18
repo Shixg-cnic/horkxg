@@ -10,6 +10,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -745,12 +746,14 @@ void SclpWorkspace<Types>::reserve_contract_buffers(std::int64_t max_edges) {
     ws.unique_keys.resize(capacity);
     ws.unique_values.resize(capacity);
     std::size_t radix_bytes = 0;
-    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        nullptr, radix_bytes,
+    cub::DoubleBuffer<std::uint64_t> sort_keys(
         thrust::raw_pointer_cast(ws.affinity_keys.data()),
-        thrust::raw_pointer_cast(ws.unique_keys.data()),
+        thrust::raw_pointer_cast(ws.unique_keys.data()));
+    cub::DoubleBuffer<std::uint64_t> sort_values(
         thrust::raw_pointer_cast(ws.affinity_values.data()),
-        thrust::raw_pointer_cast(ws.unique_values.data()),
+        thrust::raw_pointer_cast(ws.unique_values.data()));
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        nullptr, radix_bytes, sort_keys, sort_values,
         static_cast<typename Types::OffsetT>(max_edges)));
     ws.radix_temp.resize(radix_bytes);
 }
@@ -1019,23 +1022,27 @@ DeviceAggregateResult<Types> aggregate(
                 thrust::raw_pointer_cast(affinity_values.data()));
             CUDA_CHECK(cudaGetLastError());
             std::size_t affinity_radix_bytes = 0;
-            CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-                nullptr, affinity_radix_bytes,
+            cub::DoubleBuffer<std::uint64_t> sort_keys(
                 thrust::raw_pointer_cast(affinity_keys.data()),
-                thrust::raw_pointer_cast(unique_keys.data()),
+                thrust::raw_pointer_cast(unique_keys.data()));
+            cub::DoubleBuffer<std::uint64_t> sort_values(
                 thrust::raw_pointer_cast(affinity_values.data()),
-                thrust::raw_pointer_cast(unique_values.data()),
+                thrust::raw_pointer_cast(unique_values.data()));
+            CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+                nullptr, affinity_radix_bytes, sort_keys, sort_values,
                 static_cast<typename Types::OffsetT>(high_edge_count)));
             radix_temp.resize(std::max(radix_temp.size(), affinity_radix_bytes));
             auto affinity_radix_call_bytes = affinity_radix_bytes;
             CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
                 thrust::raw_pointer_cast(radix_temp.data()),
-                affinity_radix_call_bytes,
-                thrust::raw_pointer_cast(affinity_keys.data()),
-                thrust::raw_pointer_cast(unique_keys.data()),
-                thrust::raw_pointer_cast(affinity_values.data()),
-                thrust::raw_pointer_cast(unique_values.data()),
+                affinity_radix_call_bytes, sort_keys, sort_values,
                 static_cast<typename Types::OffsetT>(high_edge_count)));
+            // Keep the existing reduce input/output roles regardless of the
+            // number of radix passes. Only ownership changes, never edge order.
+            if (sort_keys.Current() == thrust::raw_pointer_cast(affinity_keys.data())) {
+                affinity_keys.swap(unique_keys);
+                affinity_values.swap(unique_values);
+            }
             const auto valid_end = thrust::lower_bound(
                 thrust::device, unique_keys.begin(),
                 unique_keys.begin() + high_edge_count,
@@ -1411,9 +1418,10 @@ DeviceAggregateResult<Types> aggregate(
 }
 
 template <typename Types>
-DeviceWeightedGraph<Types> contract(
-    DeviceWeightedGraph<Types> fine, DeviceAggregateResult<Types>&& aggregate,
-    SclpWorkspace<Types>& workspace, ContractionTimings& timings) {
+DeviceWeightedGraph<Types> contract_impl(
+    const DeviceWeightedGraph<Types>& fine, DeviceAggregateResult<Types>&& aggregate,
+    SclpWorkspace<Types>& workspace, ContractionTimings& timings,
+    DeviceWeightedGraph<Types>* recycle) {
     GpuEventTimer contraction_timer;
     auto& ws = *workspace.impl;
     const auto n = fine.vertices();
@@ -1451,23 +1459,26 @@ DeviceWeightedGraph<Types> contract(
         unique_values.resize(static_cast<std::size_t>(cross_edges));
     }
     std::size_t contraction_radix_bytes = 0;
-    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        nullptr, contraction_radix_bytes,
+    cub::DoubleBuffer<std::uint64_t> sort_keys(
         thrust::raw_pointer_cast(keys.data()),
-        thrust::raw_pointer_cast(unique_keys.data()),
+        thrust::raw_pointer_cast(unique_keys.data()));
+    cub::DoubleBuffer<std::uint64_t> sort_values(
         thrust::raw_pointer_cast(values.data()),
-        thrust::raw_pointer_cast(unique_values.data()),
+        thrust::raw_pointer_cast(unique_values.data()));
+    CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
+        nullptr, contraction_radix_bytes, sort_keys, sort_values,
         static_cast<typename Types::OffsetT>(cross_edges)));
     ws.radix_temp.resize(contraction_radix_bytes);
     GpuEventTimer sort_timer;
     auto call_radix_bytes = contraction_radix_bytes;
     CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
         thrust::raw_pointer_cast(ws.radix_temp.data()), call_radix_bytes,
-        thrust::raw_pointer_cast(keys.data()),
-        thrust::raw_pointer_cast(unique_keys.data()),
-        thrust::raw_pointer_cast(values.data()),
-        thrust::raw_pointer_cast(unique_values.data()),
+        sort_keys, sort_values,
         static_cast<typename Types::OffsetT>(cross_edges)));
+    if (sort_keys.Current() == thrust::raw_pointer_cast(keys.data())) {
+        keys.swap(unique_keys);
+        values.swap(unique_values);
+    }
     timings.sort_seconds = sort_timer.seconds();
     GpuEventTimer reduce_timer;
     const auto reduced = thrust::reduce_by_key(
@@ -1483,7 +1494,8 @@ DeviceWeightedGraph<Types> contract(
                   static_cast<double>(cross_edges) / static_cast<double>(m))
               << '\n';
 
-    DeviceWeightedGraph<Types> coarse = std::move(fine);
+    DeviceWeightedGraph<Types> coarse;
+    if (recycle != nullptr) coarse = std::move(*recycle);
     GpuEventTimer vertex_weight_timer;
     coarse.vertex_weights.resize(static_cast<std::size_t>(aggregate.coarse_vertices));
     thrust::copy(
@@ -1513,6 +1525,13 @@ DeviceWeightedGraph<Types> contract(
     timings.csr_build_seconds = csr_build_timer.seconds();
     timings.total_seconds = contraction_timer.seconds();
     return coarse;
+}
+
+template <typename Types>
+DeviceWeightedGraph<Types> contract(
+    DeviceWeightedGraph<Types> fine, DeviceAggregateResult<Types>&& aggregate,
+    SclpWorkspace<Types>& workspace, ContractionTimings& timings) {
+    return contract_impl(fine, std::move(aggregate), workspace, timings, &fine);
 }
 
 namespace {
@@ -1588,32 +1607,36 @@ void validate_coarsening_step(
 
 }  // namespace
 
-template <typename Types>
-Hierarchy<Types> coarsen(
-    const WeightedGraph<Types>& graph, const CoarsenOptions& options) {
+template <typename Types, bool Resident>
+auto coarsen_impl(
+    const WeightedGraph<Types>* graph, DeviceWeightedGraph<Types> current,
+    const CoarsenOptions& options) {
     using VertexT = typename Types::VertexT;
     const bool diagnostics = std::getenv("SCLP_DIAGNOSTICS") != nullptr;
     const bool verify = options.strict_verify;
-    const auto host_graph_build_start = std::chrono::steady_clock::now();
-    Hierarchy<Types> hierarchy;
-    hierarchy.levels.push_back(graph);
-    const auto host_graph_build_seconds = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - host_graph_build_start).count();
-
-    const auto input_verify_start = std::chrono::steady_clock::now();
-    if (options.strict_verify) {
-        validate_weighted_csr(hierarchy.levels.front(), true);
-    } else {
-        validate_weighted_shape(hierarchy.levels.front(), true);
+    std::conditional_t<Resident, DeviceHierarchy<Types>, Hierarchy<Types>> hierarchy;
+    double host_graph_build_seconds = 0.0;
+    double input_verify_seconds = 0.0;
+    if constexpr (!Resident) {
+        const auto build_start = std::chrono::steady_clock::now();
+        hierarchy.levels.push_back(*graph);
+        host_graph_build_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - build_start).count();
+        const auto verify_start = std::chrono::steady_clock::now();
+        if (options.strict_verify) {
+            validate_weighted_csr(hierarchy.levels.front(), true);
+        } else {
+            validate_weighted_shape(hierarchy.levels.front(), true);
+        }
+        input_verify_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - verify_start).count();
     }
-    const auto input_verify_seconds = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - input_verify_start).count();
     std::cout << "ml_input_verify_seconds=" << input_verify_seconds
               << " status=ok mode="
               << (options.strict_verify ? "strict" : "fast") << '\n';
 
     const auto device_input_start = std::chrono::steady_clock::now();
-    auto current = make_device_weighted(hierarchy.levels.front());
+    if constexpr (!Resident) current = make_device_weighted(hierarchy.levels.front());
     SclpWorkspace<Types> workspace;
     workspace.reserve_contract_buffers(current.edges());
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -1690,9 +1713,9 @@ Hierarchy<Types> coarsen(
 
         ContractionTimings contract_timings;
         const auto contract_wall_start = std::chrono::steady_clock::now();
-        auto coarse_device = contract(
-            std::move(current), std::move(aggregate_result),
-            workspace, contract_timings);
+        auto coarse_device = contract_impl(
+            current, std::move(aggregate_result), workspace, contract_timings,
+            Resident ? nullptr : &current);
         const auto level_contract_wall = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - contract_wall_start).count();
         device_algorithm_seconds += level_contract_wall;
@@ -1726,34 +1749,43 @@ Hierarchy<Types> coarsen(
                   << " coarse_edges=" << coarse_device.edges() << '\n';
 
         const auto snapshot_start = std::chrono::steady_clock::now();
-        std::vector<VertexT> host_map(aggregate_result.map.size());
-        thrust::copy(
-            aggregate_result.map.begin(), aggregate_result.map.end(),
-            host_map.begin());
-        auto coarse_host = copy_device_weighted(coarse_device);
+        if constexpr (Resident) {
+            // Debug verification may inspect host copies, but production does
+            // not download any level or map here.
+            if (verify) {
+                std::vector<VertexT> host_map(aggregate_result.map.size());
+                thrust::copy(aggregate_result.map.begin(), aggregate_result.map.end(),
+                             host_map.begin());
+                auto fine_host = copy_device_weighted(current);
+                auto coarse_host = copy_device_weighted(coarse_device);
+                validate_coarsening_step(fine_host, coarse_host, host_map,
+                    aggregate_result.capacity, level, true);
+            }
+            hierarchy.levels.push_back(std::move(current));
+            hierarchy.fine_to_coarse.push_back(std::move(aggregate_result.map));
+        } else {
+            std::vector<VertexT> host_map(aggregate_result.map.size());
+            thrust::copy(aggregate_result.map.begin(), aggregate_result.map.end(),
+                         host_map.begin());
+            auto coarse_host = copy_device_weighted(coarse_device);
+            if (verify) {
+                validate_coarsening_step(hierarchy.levels.back(), coarse_host, host_map,
+                    aggregate_result.capacity, level, options.strict_verify);
+            }
+            hierarchy.fine_to_coarse.push_back(std::move(host_map));
+            hierarchy.levels.push_back(std::move(coarse_host));
+        }
         const auto snapshot = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - snapshot_start).count();
-        snapshot_seconds += snapshot;
+        snapshot_seconds += Resident && !verify ? 0.0 : snapshot;
         std::cout << "ml_gpu_device_snapshot_seconds level=" << level
-                  << " seconds=" << snapshot << '\n';
-
-        if (verify) {
-            const auto verify_start = std::chrono::steady_clock::now();
-            validate_coarsening_step(
-                hierarchy.levels.back(), coarse_host, host_map,
-                aggregate_result.capacity, level, options.strict_verify);
-            std::cout << "ml_gpu_device_verify_seconds level=" << level
-                      << " seconds=" << std::chrono::duration<double>(
-                             std::chrono::steady_clock::now() - verify_start).count()
-                      << '\n';
-        }
-        hierarchy.fine_to_coarse.push_back(std::move(host_map));
-        hierarchy.levels.push_back(std::move(coarse_host));
+                  << " seconds=" << (Resident && !verify ? 0.0 : snapshot) << '\n';
         current = std::move(coarse_device);
     }
     if (level == options.max_levels && current.vertices() > cutoff) {
         hierarchy.stop_reason = "max_levels";
     }
+    if constexpr (Resident) hierarchy.levels.push_back(std::move(current));
     hierarchy.hierarchy_loop_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - core_start).count();
     hierarchy.snapshot_seconds = snapshot_seconds;
@@ -1791,6 +1823,16 @@ Hierarchy<Types> coarsen(
     return hierarchy;
 }
 
+template <typename Types>
+Hierarchy<Types> coarsen(const WeightedGraph<Types>& graph, const CoarsenOptions& options) {
+    return coarsen_impl<Types, false>(&graph, {}, options);
+}
+
+template <typename Types>
+DeviceHierarchy<Types> coarsen(DeviceWeightedGraph<Types>&& graph, const CoarsenOptions& options) {
+    return coarsen_impl<Types, true>(nullptr, std::move(graph), options);
+}
+
 template class SclpWorkspace<ActiveTypes>;
 template DeviceAggregateResult<ActiveTypes> aggregate<ActiveTypes>(
     const DeviceWeightedGraph<ActiveTypes>&, SclpWorkspace<ActiveTypes>&,
@@ -1800,5 +1842,7 @@ template DeviceWeightedGraph<ActiveTypes> contract<ActiveTypes>(
     SclpWorkspace<ActiveTypes>&, ContractionTimings&);
 template Hierarchy<ActiveTypes> coarsen<ActiveTypes>(
     const WeightedGraph<ActiveTypes>&, const CoarsenOptions&);
+template DeviceHierarchy<ActiveTypes> coarsen<ActiveTypes>(
+    DeviceWeightedGraph<ActiveTypes>&&, const CoarsenOptions&);
 
 }  // namespace gpart
