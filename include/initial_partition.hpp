@@ -6,6 +6,13 @@
 
 namespace gpart {
 
+// Experimental GPU spectral recursive bisection. METIS remains the default.
+// Requires a validated symmetric nonnegative weighted CSR, just like coarsen.
+template <typename Types>
+thrust::device_vector<typename Types::VertexT> initial_partition_gpu(
+    const DeviceWeightedGraph<Types>& graph, int parts, double imbalance_ratio,
+    std::uint32_t seed = 0);
+
 template <typename Types>
 std::vector<typename Types::VertexT> initial_partition(
     const WeightedGraph<Types>& graph,

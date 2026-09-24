@@ -4,11 +4,13 @@
 #include "refine.hpp"
 #include "uncoarsen.hpp"
 #include "coarsen.hpp"
+#include "detail/scratch_pool.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 #include <vector>
 
@@ -68,12 +70,227 @@ void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+void check_scratch_pool_lifetime() {
+    const auto previous = gpart::detail::active_scratch_pool;
+    gpart::detail::ScratchVector<int> retained(5, 2);
+    {
+        gpart::detail::ScratchPoolSession nested;
+        gpart::detail::ScratchVector<int> temporary(17, 9);
+        retained = std::move(temporary);
+        nested.finish();
+    }
+    require(gpart::detail::active_scratch_pool == previous,
+            "scratch session did not restore its caller's pool");
+    retained.resize(33, 9);
+    std::vector<int> values(retained.size());
+    thrust::copy(retained.begin(), retained.end(), values.begin());
+    require(values == std::vector<int>(33, 9),
+            "scratch vector lost storage after its session finished");
+
+    // Exercise stream ordering directly: vector operations may synchronize
+    // internally and would otherwise hide an incorrectly ordered free/reuse.
+    gpart::detail::ScratchPoolSession ordered;
+    gpart::detail::ScratchAllocator<int> allocator;
+    constexpr std::size_t count = 257;
+    auto source = allocator.allocate(count);
+    auto saved = allocator.allocate(count);
+    CUDA_CHECK(cudaMemsetAsync(thrust::raw_pointer_cast(source), 0x11,
+                              count * sizeof(int), nullptr));
+    CUDA_CHECK(cudaMemcpyAsync(thrust::raw_pointer_cast(saved),
+        thrust::raw_pointer_cast(source), count * sizeof(int),
+        cudaMemcpyDeviceToDevice, nullptr));
+    allocator.deallocate(source, count);
+    auto reused = allocator.allocate(count);
+    CUDA_CHECK(cudaMemsetAsync(thrust::raw_pointer_cast(reused), 0x22,
+                              count * sizeof(int), nullptr));
+    std::vector<int> saved_values(count);
+    CUDA_CHECK(cudaMemcpy(saved_values.data(), thrust::raw_pointer_cast(saved),
+                         count * sizeof(int), cudaMemcpyDeviceToHost));
+    require(saved_values == std::vector<int>(count, 0x11111111),
+            "scratch reuse overtook a pending default-stream read");
+    allocator.deallocate(saved, count);
+    allocator.deallocate(reused, count);
+    ordered.finish();
+}
+
+template <typename Types>
+void check_parallel_cut() {
+    using V = typename Types::VertexT;
+    using W = typename Types::WeightT;
+    constexpr int n = 259;
+    std::vector<std::vector<V>> rows(n);
+    const auto add = [&](int v, int u) { rows[v].push_back(u); rows[u].push_back(v); };
+    for (int v = 1; v < n - 1; ++v) {
+        add(0, v);
+        add(0, v); // Repeated entries must each contribute their weight.
+        if (v > 1) add(v - 1, v);
+    }
+    gpart::WeightedGraph<Types> graph;
+    graph.offsets.push_back(0);
+    graph.vertex_weights.assign(n, 1);
+    W weight = 7;
+    if constexpr (sizeof(W) == 8) weight = W{1} << 40;
+    for (auto& row : rows) {
+        std::sort(row.begin(), row.end());
+        graph.neighbors.insert(graph.neighbors.end(), row.begin(), row.end());
+        graph.edge_weights.insert(graph.edge_weights.end(), row.size(), weight);
+        graph.offsets.push_back(graph.neighbors.size());
+    }
+    // Hub, isolated tail vertex, partial final block and >32-bit cut totals.
+    for (bool interleaved : {false, true}) {
+        std::vector<V> labels(n);
+        for (int v = 0; v < n; ++v) labels[v] = interleaved ? v % 4 : v / 65;
+        const auto original = labels;
+        const auto expected = gpart::host_cut(graph, labels);
+        gpart::RefineOptions options;
+        options.parts = 4;
+        options.imbalance_ratio = 1.10;
+        options.max_rounds = 0;
+        options.strict_verify = true;
+        gpart::RefineStats stats;
+        gpart::refine_partition(graph, labels, options, &stats);
+        require(labels == original && stats.initial_cut == expected && stats.final_cut == expected,
+                "parallel cut differs from independent CPU cut");
+    }
+}
+
+template <typename Types>
+void check_cross_edge_contraction() {
+    using V = typename Types::VertexT;
+    using W = typename Types::WeightT;
+    using O = typename Types::OffsetT;
+    // Non-warp-aligned row count, empty rows, duplicate entries, self loops,
+    // all-internal edges, and repeated calls using the same scratch buffers.
+    gpart::SclpWorkspace<Types> workspace;
+    for (int groups : {7, 1, 7}) {
+        constexpr int n = 35;
+        gpart::WeightedGraph<Types> input, expected;
+        std::vector<V> mapping(n);
+        expected.vertex_weights.assign(groups, W{0});
+        input.vertex_weights.assign(n, W{1});
+        input.offsets.push_back(0);
+        std::map<std::pair<V, V>, W> edges;
+        W weight = W{3};
+        if constexpr (sizeof(W) == 8) weight = W{1} << 40;
+        for (int v = 0; v < n; ++v) {
+            mapping[v] = v % groups;
+            ++expected.vertex_weights[mapping[v]];
+            for (int u = 0; u < n - 1 && v < n - 1; ++u) {
+                for (int duplicate = 0; duplicate < 2; ++duplicate) {
+                    input.neighbors.push_back(u);
+                    input.edge_weights.push_back(weight);
+                    if (v % groups != u % groups)
+                        edges[{v % groups, u % groups}] += weight;
+                }
+            }
+            input.offsets.push_back(static_cast<O>(input.neighbors.size()));
+        }
+        expected.offsets.push_back(0);
+        for (int v = 0; v < groups; ++v) {
+            for (const auto& edge : edges) if (edge.first.first == v) {
+                expected.neighbors.push_back(edge.first.second);
+                expected.edge_weights.push_back(edge.second);
+            }
+            expected.offsets.push_back(static_cast<O>(expected.neighbors.size()));
+        }
+        gpart::DeviceAggregateResult<Types> aggregate;
+        aggregate.map.assign(mapping.begin(), mapping.end());
+        aggregate.vertex_weights.assign(expected.vertex_weights.begin(), expected.vertex_weights.end());
+        aggregate.coarse_vertices = groups;
+        gpart::ContractionTimings timing;
+        auto actual = gpart::copy_device_weighted(gpart::contract(
+            gpart::make_device_weighted(input), std::move(aggregate), workspace, timing));
+        require(actual.offsets == expected.offsets && actual.neighbors == expected.neighbors &&
+                actual.edge_weights == expected.edge_weights && actual.vertex_weights == expected.vertex_weights,
+                "cross-edge contraction differs from independent CPU reduction");
+    }
+    for (bool empty : {false, true}) {
+        auto input = make_hierarchy<Types>().levels.front();
+        if (empty) {
+            input.neighbors.clear();
+            input.edge_weights.clear();
+            input.offsets.assign(input.vertices() + 1, 0);
+        }
+        std::vector<V> identity{0, 1, 2, 3};
+        gpart::DeviceAggregateResult<Types> aggregate;
+        aggregate.coarse_vertices = 4;
+        aggregate.map.assign(identity.begin(), identity.end());
+        aggregate.vertex_weights.assign(input.vertex_weights.begin(), input.vertex_weights.end());
+        gpart::ContractionTimings timing;
+        auto actual = gpart::copy_device_weighted(gpart::contract(
+            gpart::make_device_weighted(input), std::move(aggregate), workspace, timing));
+        require(actual.offsets == input.offsets && actual.neighbors == input.neighbors &&
+                actual.edge_weights == input.edge_weights && actual.vertex_weights == input.vertex_weights,
+                "identity contraction changed singleton or empty CSR rows");
+    }
+}
+
+template <typename Types>
+void check_sort_weight_width() {
+    using V = typename Types::VertexT;
+    using W = typename Types::WeightT;
+    // Exercise the hub-sort path, duplicate edges, and the >UINT32_MAX
+    // total-weight fallback. Compare every level to the original 64-bit path.
+    std::vector<W> tested_weights{W{1}, W{1000000}};
+    if constexpr (sizeof(W) == 8) tested_weights.push_back(W{1} << 40);
+    for (W weight : tested_weights) {
+        constexpr int n = 4096;
+        std::vector<std::vector<V>> rows(n);
+        const auto add = [&](int a, int b) { rows[a].push_back(b); rows[b].push_back(a); };
+        for (int v = 0; v < n; ++v) add(v, (v + 1) % n);
+        for (int v = 1; v <= 512; ++v) add(0, v);
+        rows[0].push_back(0); // Hub sentinel must not collide with a packed key.
+        gpart::WeightedGraph<Types> input;
+        input.offsets.push_back(0);
+        input.vertex_weights.assign(n, 1);
+        for (auto& row : rows) {
+            std::sort(row.begin(), row.end());
+            input.neighbors.insert(input.neighbors.end(), row.begin(), row.end());
+            input.edge_weights.insert(input.edge_weights.end(), row.size(), weight);
+            input.offsets.push_back(input.neighbors.size());
+        }
+        gpart::CoarsenOptions options;
+        auto candidate = gpart::coarsen(gpart::make_device_weighted(input), options);
+        require(candidate.levels.capacity() >= static_cast<std::size_t>(options.max_levels) + 1 &&
+                candidate.fine_to_coarse.capacity() >= static_cast<std::size_t>(options.max_levels),
+                "device hierarchy growth can deep-copy previous GPU levels");
+        auto reference = gpart::make_device_weighted(input);
+        gpart::SclpWorkspace<Types> workspace; // Default standalone path is 64-bit.
+        std::size_t produced = 1;
+        for (int level = 0; level < options.max_levels && reference.vertices() > 1024; ++level) {
+            gpart::SclpStats stats;
+            auto aggregate = gpart::aggregate(reference, workspace, 4, level, level, stats, false);
+            if (aggregate.coarse_vertices >= reference.vertices() ||
+                double(aggregate.coarse_vertices) / reference.vertices() > options.stop_contraction_ratio) break;
+            require(produced < candidate.levels.size(), "packed hierarchy ended early");
+            std::vector<V> expected_map(aggregate.map.size()), actual_map(aggregate.map.size());
+            thrust::copy(aggregate.map.begin(), aggregate.map.end(), expected_map.begin());
+            thrust::copy(candidate.fine_to_coarse[level].begin(), candidate.fine_to_coarse[level].end(), actual_map.begin());
+            require(expected_map == actual_map, "packed affinity changed mapping");
+            gpart::ContractionTimings timing;
+            reference = gpart::contract(std::move(reference), std::move(aggregate), workspace, timing);
+            auto expected = gpart::copy_device_weighted(reference);
+            auto actual = gpart::copy_device_weighted(candidate.levels[produced++]);
+            require(expected.offsets == actual.offsets && expected.neighbors == actual.neighbors &&
+                    expected.edge_weights == actual.edge_weights && expected.vertex_weights == actual.vertex_weights,
+                    "packed sort/reduce changed CSR");
+        }
+        require(produced == candidate.levels.size(), "packed hierarchy has extra levels");
+    }
+}
+
 }  // namespace
 
 int main() {
     try {
+        check_scratch_pool_lifetime();
+        gpart::detail::ScratchPoolSession scratch_pool;
+        check_scratch_pool_lifetime();
         using Types = gpart::ActiveTypes;
         using VertexT = typename Types::VertexT;
+        check_parallel_cut<Types>();
+        check_cross_edge_contraction<Types>();
+        check_sort_weight_width<Types>();
         auto hierarchy = make_hierarchy<Types>();
         // Both CSR validation paths must retain all rejection conditions.
         for (int failure = 0; failure < 4; ++failure) {

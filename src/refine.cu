@@ -1,6 +1,7 @@
 #include "refine.hpp"
 
 #include "check.hpp"
+#include "detail/scratch_pool.hpp"
 #include "graph_types.hpp"
 
 #include <algorithm>
@@ -443,16 +444,33 @@ __global__ void refine_cut_kernel(
     const WeightT* edge_weights,
     const VertexT* partition,
     unsigned long long* directed_cut) {
+    const int lane = threadIdx.x & (kWarpSize - 1);
+    const int warp = threadIdx.x / kWarpSize;
     const auto vertex = static_cast<std::int64_t>(blockIdx.x) *
-        blockDim.x + threadIdx.x;
-    if (vertex >= n) return;
+        kWarpsPerBlock + warp;
+    __shared__ unsigned long long warp_cuts[kWarpsPerBlock];
     unsigned long long local = 0;
-    for (auto edge = offsets[vertex]; edge < offsets[vertex + 1]; ++edge) {
-        if (partition[vertex] != partition[neighbors[edge]]) {
-            local += static_cast<unsigned long long>(edge_weights[edge]);
+    if (vertex < n) {
+        const auto source = partition[vertex];
+        for (std::int64_t edge = static_cast<std::int64_t>(offsets[vertex]) + lane;
+             edge < static_cast<std::int64_t>(offsets[vertex + 1]); edge += kWarpSize) {
+            if (source != partition[neighbors[edge]]) {
+                local += static_cast<unsigned long long>(edge_weights[edge]);
+            }
         }
     }
-    if (local != 0) atomicAdd(directed_cut, local);
+    // Sum the same directed entries as before, using exact uint64 arithmetic.
+    // Tail warps participate with zero so every thread reaches the barrier.
+    for (int delta = kWarpSize / 2; delta; delta /= 2)
+        local += __shfl_down_sync(0xffffffffU, local, delta);
+    if (lane == 0) warp_cuts[warp] = local;
+    __syncthreads();
+    if (warp == 0) {
+        local = lane < kWarpsPerBlock ? warp_cuts[lane] : 0;
+        for (int delta = kWarpSize / 2; delta; delta /= 2)
+            local += __shfl_down_sync(0xffffffffU, local, delta);
+        if (lane == 0 && local != 0) atomicAdd(directed_cut, local);
+    }
 }
 
 template <typename VertexT>
@@ -489,7 +507,8 @@ std::uint64_t device_cut_value(
     const thrust::device_vector<typename Types::VertexT>& partition,
     thrust::device_vector<unsigned long long>& cut_counter) {
     const auto n = graph.vertices();
-    const int blocks = static_cast<int>((n + 255) / 256);
+    if (n == 0) return 0;
+    const int blocks = static_cast<int>((n + kWarpsPerBlock - 1) / kWarpsPerBlock);
     thrust::fill(cut_counter.begin(), cut_counter.end(), 0ULL);
     refine_cut_kernel<<<blocks, 256>>>(
         n,
@@ -574,29 +593,29 @@ template <typename Types>
 class RefineWorkspace {
 public:
     using VertexT = typename Types::VertexT;
-    thrust::device_vector<VertexT> previous_partition;
-    thrust::device_vector<unsigned long long> previous_part_weights;
+    detail::ScratchVector<VertexT> previous_partition;
+    detail::ScratchVector<unsigned long long> previous_part_weights;
     thrust::device_vector<unsigned long long> cut_counter;
-    thrust::device_vector<RefineAdmissionKey> proposal_keys;
-    thrust::device_vector<RefineAdmissionKey> compact_keys;
-    thrust::device_vector<RefineAdmissionKey> sorted_keys;
-    thrust::device_vector<PairAdmissionKey> pair_proposal_keys;
-    thrust::device_vector<PairAdmissionKey> pair_compact_keys;
-    thrust::device_vector<PairAdmissionKey> pair_sorted_keys;
-    thrust::device_vector<std::uint32_t> pair_targets;
-    thrust::device_vector<std::int64_t> signed_gains;
-    thrust::device_vector<VertexT> best_partners;
-    thrust::device_vector<std::int64_t> best_pair_gains;
-    thrust::device_vector<std::uint64_t> candidate_counts;
-    thrust::device_vector<std::int32_t> ordered_targets;
-    thrust::device_vector<std::uint64_t> ordered_weights;
-    thrust::device_vector<std::uint64_t> prefix_weights;
-    thrust::device_vector<std::int32_t> accepted_flags;
-    thrust::device_vector<std::uint8_t> radix_temp;
+    detail::ScratchVector<RefineAdmissionKey> proposal_keys;
+    detail::ScratchVector<RefineAdmissionKey> compact_keys;
+    detail::ScratchVector<RefineAdmissionKey> sorted_keys;
+    detail::ScratchVector<PairAdmissionKey> pair_proposal_keys;
+    detail::ScratchVector<PairAdmissionKey> pair_compact_keys;
+    detail::ScratchVector<PairAdmissionKey> pair_sorted_keys;
+    detail::ScratchVector<std::uint32_t> pair_targets;
+    detail::ScratchVector<std::int64_t> signed_gains;
+    detail::ScratchVector<VertexT> best_partners;
+    detail::ScratchVector<std::int64_t> best_pair_gains;
+    detail::ScratchVector<std::uint64_t> candidate_counts;
+    detail::ScratchVector<std::int32_t> ordered_targets;
+    detail::ScratchVector<std::uint64_t> ordered_weights;
+    detail::ScratchVector<std::uint64_t> prefix_weights;
+    detail::ScratchVector<std::int32_t> accepted_flags;
+    detail::ScratchVector<std::uint8_t> radix_temp;
     double resize_seconds = 0.0;
 
-    template <typename T>
-    void grow(thrust::device_vector<T>& buffer, std::size_t required) {
+    template <typename T, typename Allocator>
+    void grow(thrust::device_vector<T, Allocator>& buffer, std::size_t required) {
         if (buffer.size() < required) {
             const auto start = std::chrono::steady_clock::now();
             buffer.resize(required);

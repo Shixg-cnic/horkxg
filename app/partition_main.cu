@@ -4,6 +4,7 @@
 #include "initial_partition.hpp"
 #include "uncoarsen.hpp"
 #include "check.hpp"
+#include "detail/scratch_pool.hpp"
 #include <thrust/copy.h>
 
 #include <cstdint>
@@ -17,12 +18,19 @@
 int main(int argc, char** argv) {
     try {
         const auto wall_start = std::chrono::steady_clock::now();
-        const bool verify = argc > 1 && std::string(argv[argc - 1]) == "--verify";
-        const int positional_argc = argc - (verify ? 1 : 0);
+        bool verify = false, gpu_initial = false;
+        int positional_argc = argc;
+        while (positional_argc > 1) {
+            const std::string flag(argv[positional_argc - 1]);
+            if (flag == "--verify") verify = true;
+            else if (flag == "--gpu-initial") gpu_initial = true;
+            else break;
+            --positional_argc;
+        }
         if (positional_argc < 5 || positional_argc > 7) {
             std::cerr << "Usage: " << argv[0]
                       << " <indptr.bin> <indices.bin> <parts> <partition.out>"
-                      << " [imbalance_ratio] [seed] [--verify]\n";
+                      << " [imbalance_ratio] [seed] [--verify] [--gpu-initial]\n";
             return 2;
         }
         using Types = gpart::ActiveTypes;
@@ -46,12 +54,14 @@ int main(int argc, char** argv) {
         auto device_graph = gpart::make_device_weighted(graph);
         CUDA_CHECK(cudaDeviceSynchronize());
         const auto coarsen_start = std::chrono::steady_clock::now();
+        gpart::detail::ScratchPoolSession scratch_pool;
         auto hierarchy = gpart::coarsen<Types>(std::move(device_graph), coarsen_options);
         CUDA_CHECK(cudaDeviceSynchronize());
         const auto coarsen_end = std::chrono::steady_clock::now();
         const auto initial_start = std::chrono::steady_clock::now();
-        auto coarse_partition = gpart::initial_partition<Types>(
-            hierarchy.levels.back(), parts, imbalance);
+        auto coarse_partition = gpu_initial
+            ? gpart::initial_partition_gpu<Types>(hierarchy.levels.back(), parts, imbalance, seed)
+            : gpart::initial_partition<Types>(hierarchy.levels.back(), parts, imbalance);
         CUDA_CHECK(cudaDeviceSynchronize());
         const auto initial_end = std::chrono::steady_clock::now();
         gpart::RefineOptions refine_options;
@@ -68,6 +78,7 @@ int main(int argc, char** argv) {
 
         hierarchy.levels.clear();
         hierarchy.fine_to_coarse.clear();
+        scratch_pool.finish();
         CUDA_CHECK(cudaDeviceSynchronize());
         const auto free_end = std::chrono::steady_clock::now();
         std::vector<typename Types::VertexT> partition(result.device_partition.size());
