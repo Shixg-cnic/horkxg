@@ -12,26 +12,23 @@
 
 int main(int argc, char** argv) {
     try {
-        if (argc < 5 || argc > 11) {
+        int positional_argc = argc;
+        const bool verify = argc > 1 && std::string(argv[argc - 1]) == "--verify";
+        if (verify) --positional_argc;
+        if (positional_argc < 5 || positional_argc > 8) {
             std::cerr << "Usage: " << argv[0]
                       << " <indptr.bin> <indices.bin> <parts> <hierarchy.out>"
-                      << " [max_vertex_ratio] [seed] [stop_contraction_ratio]"
-                      << " [coarsen_method=sclp] [unused] [max_levels]\n";
+                      << " [seed=0] [stop_contraction_ratio=0.90] [max_levels=24] [--verify]\n";
             return 2;
         }
         const int parts = std::stoi(argv[3]);
-        const double ratio = argc >= 6 ? std::stod(argv[5]) : 1.10;
-        const std::uint32_t seed = argc >= 7
-            ? static_cast<std::uint32_t>(std::stoul(argv[6])) : 0U;
-        const double stop_contraction_ratio = argc >= 8
-            ? std::stod(argv[7]) : 0.90;
-        const std::string method = argc >= 9 ? argv[8] : "sclp";
-        const int max_levels = argc >= 11 ? std::stoi(argv[10]) : 24;
-        if (parts < 2 || parts > 32 || ratio < 1.0) {
-            throw std::runtime_error("invalid parts or maximum vertex ratio");
-        }
-        if (method != "sclp") {
-            throw std::runtime_error("coarsen_method must be sclp");
+        const std::uint32_t seed = positional_argc >= 6
+            ? static_cast<std::uint32_t>(std::stoul(argv[5])) : 0U;
+        const double stop_contraction_ratio = positional_argc >= 7
+            ? std::stod(argv[6]) : 0.90;
+        const int max_levels = positional_argc >= 8 ? std::stoi(argv[7]) : 24;
+        if (parts < 2 || parts > 32) {
+            throw std::runtime_error("parts must be between 2 and 32");
         }
         if (stop_contraction_ratio <= 0.0 || stop_contraction_ratio > 1.0) {
             throw std::runtime_error("invalid coarsening stop ratio");
@@ -48,15 +45,14 @@ int main(int argc, char** argv) {
         options.seed = seed;
         options.stop_contraction_ratio = stop_contraction_ratio;
         options.max_levels = max_levels;
-        options.strict_verify =
-            std::getenv("GPU_LP_STRICT_VERIFY") != nullptr;
+        options.strict_verify = verify;
         auto hierarchy = gpart::coarsen<Types>(input, options);
 
         const bool skip_export =
             std::getenv("ML_SKIP_HIERARCHY_EXPORT") != nullptr;
         const auto export_start = std::chrono::steady_clock::now();
         if (!skip_export) {
-            gpart::write_jet_hierarchy(hierarchy, argv[4]);
+            gpart::write_hierarchy(hierarchy, argv[4]);
         }
         std::cout << "ml_hierarchy_export_seconds="
                   << std::chrono::duration<double>(

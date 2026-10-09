@@ -1,6 +1,6 @@
 # graph_untils
 
-Generate a small random graph in the same binary CSR layout used by `kim2`.
+Generate, convert, and analyze graphs in this project's binary CSR layout.
 
 For a graph named `toy`, the tool writes four files:
 
@@ -30,14 +30,17 @@ cmake --build graph_untils/build
   --seed 1
 ```
 
-The generated files can be fed into the single-card partition prototype:
+Symmetrize the generated graph before running the multilevel GPU partitioner:
 
 ```bash
-single_gpu_csr/build/cpu_weighted_lp \
+graph_untils/build/csr_symmetrize \
   --indptr graph_untils/out/toy_indptr.bin \
   --indices graph_untils/out/toy_indices.bin \
-  --parts 2 \
-  --iters 4
+  --output-dir graph_untils/out/toy-symmetric --output-name toy
+build-5090/gpart_partition_standard \
+  graph_untils/out/toy-symmetric/toy_indptr.bin \
+  graph_untils/out/toy-symmetric/toy_indices.bin \
+  2 graph_untils/out/toy.part
 ```
 
 ## Analyze a partition result
@@ -46,6 +49,20 @@ single_gpu_csr/build/cpu_weighted_lp \
 then reports a compact graph partition quality table.
 
 The partition txt format is one part id per line, matching vertex ids `0..N-1`.
+The current GPU partitioner writes binary int32 labels. Use
+`tools/verify_partition.py` directly for cut/load checks, or convert to
+text before invoking this analyzer:
+
+```bash
+python3 - <<'PY'
+from array import array
+from pathlib import Path
+labels = array('i')
+labels.frombytes(Path('graph_untils/out/toy.part').read_bytes())
+Path('graph_untils/out/toy.txt').write_text(''.join(f'{v}\n' for v in labels))
+PY
+```
+
 For the original graph, pass either `--graph-dir DIR --name NAME` for the usual
 `NAME_indptr.bin`, `NAME_indices.bin`, and optional `NAME_values.bin` files, or
 pass the CSR files explicitly.

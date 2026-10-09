@@ -703,34 +703,6 @@ __global__ void sclp_pair_flags_kernel(
         ordered_weights[i - 1] <= capacity - ordered_weights[i] ? 1 : 0;
 }
 
-// Use two MinHash coordinates to order vertices sharing a favorite. Similar
-// remaining neighborhoods tend to have equal sketches and become adjacent
-// pair candidates, instead of being paired only by unrelated ID hashes.
-template <typename OffsetT>
-__global__ void sclp_similarity_order_kernel(std::int64_t n,const OffsetT* offsets,
-    const std::int32_t* neighbors,const std::int32_t* clusters,
-    const std::int32_t* favorites,unsigned long long* order_scores) {
-    const auto v=static_cast<std::int64_t>(blockIdx.x)*WARPS_PER_BLOCK+threadIdx.x/32;
-    const int lane=threadIdx.x&31;
-    if (v>=n || favorites[v]==SCLP_INVALID) return;
-    std::uint32_t first=UINT32_MAX,second=UINT32_MAX;
-    for (std::int64_t e=static_cast<std::int64_t>(offsets[v])+lane;e<offsets[v+1];e+=32) {
-        const auto c=clusters[neighbors[e]];
-        if (c==clusters[v] || c==favorites[v]) continue;
-        first=min(first,mix32(static_cast<std::uint32_t>(c)^0x9e3779b9U));
-        second=min(second,mix32(static_cast<std::uint32_t>(c)^0x85ebca6bU));
-    }
-    for (int s=16;s;s/=2) {
-        first=min(first,__shfl_down_sync(0xffffffffU,first,s));
-        second=min(second,__shfl_down_sync(0xffffffffU,second,s));
-    }
-    if (!lane) {
-        const auto sketch=first==UINT32_MAX && second==UINT32_MAX ? 0ULL:
-            (static_cast<unsigned long long>(first)<<32)|second;
-        order_scores[v]=~sketch;
-    }
-}
-
 __global__ void sclp_two_hop_pair_commit_kernel(
     std::int64_t count, const std::int32_t* order,
     const std::int32_t* pair_flags, const std::int32_t* pair_positions,
@@ -967,7 +939,7 @@ DeviceAggregateResult<Types> aggregate_typed(
     const DeviceWeightedGraph<Types>& graph, SclpWorkspace<Types>& workspace,
     int parts, std::uint32_t seed,
     int level, SclpStats& stats, bool diagnostics, int cluster_size_factor,
-    bool pack_isolated, int maximum_rounds,bool similarity_order) {
+    bool pack_isolated) {
     auto& ws = *workspace.impl;
     GpuEventTimer aggregate_timer;
     const auto n = graph.vertices();
@@ -975,6 +947,7 @@ DeviceAggregateResult<Types> aggregate_typed(
     if (n <= 0 || n > std::numeric_limits<std::int32_t>::max()) {
         throw std::runtime_error("SCLP coarsening received an unsupported graph size");
     }
+    constexpr int maximum_rounds = 4;
     constexpr bool two_hop_enabled = true;
     constexpr double two_hop_threshold = 0.60;
     const auto total_weight = thrust::reduce(
@@ -1485,13 +1458,6 @@ DeviceAggregateResult<Types> aggregate_typed(
             thrust::raw_pointer_cast(proposals.data()),
             thrust::raw_pointer_cast(favorites.data()));
         CUDA_CHECK(cudaGetLastError());
-        if (similarity_order) {
-            sclp_similarity_order_kernel<<<static_cast<int>((n+WARPS_PER_BLOCK-1)/WARPS_PER_BLOCK),256>>>(
-                n,thrust::raw_pointer_cast(graph.offsets.data()),thrust::raw_pointer_cast(graph.neighbors.data()),
-                thrust::raw_pointer_cast(clusters.data()),thrust::raw_pointer_cast(favorites.data()),
-                thrust::raw_pointer_cast(gains.data()));
-            CUDA_CHECK(cudaGetLastError());
-        }
         const auto singleton_candidates = build_admission_order(
             favorites, gains, proposal_ties);
         stats.singleton_with_favorite = static_cast<std::uint64_t>(
@@ -1696,12 +1662,12 @@ template <typename Types>
 DeviceAggregateResult<Types> aggregate(
     const DeviceWeightedGraph<Types>& graph, SclpWorkspace<Types>& workspace,
     int parts, std::uint32_t seed, int level, SclpStats& stats, bool diagnostics,
-    int cluster_size_factor, bool pack_isolated, int max_lp_rounds,bool similarity_order) {
-    if (parts < 2 || parts > 32 || cluster_size_factor < 2 || max_lp_rounds<1 || max_lp_rounds>32)
+    int cluster_size_factor, bool pack_isolated) {
+    if (parts < 2 || parts > 32 || cluster_size_factor < 2)
         throw std::invalid_argument("invalid SCLP cluster capacity options");
     if (workspace.impl->packed_weights)
-        return aggregate_typed<Types, std::uint32_t>(graph, workspace, parts, seed, level, stats, diagnostics, cluster_size_factor, pack_isolated,max_lp_rounds,similarity_order);
-    return aggregate_typed<Types, std::uint64_t>(graph, workspace, parts, seed, level, stats, diagnostics, cluster_size_factor, pack_isolated,max_lp_rounds,similarity_order);
+        return aggregate_typed<Types, std::uint32_t>(graph, workspace, parts, seed, level, stats, diagnostics, cluster_size_factor, pack_isolated);
+    return aggregate_typed<Types, std::uint64_t>(graph, workspace, parts, seed, level, stats, diagnostics, cluster_size_factor, pack_isolated);
 }
 
 
@@ -2040,7 +2006,7 @@ auto coarsen_impl(
         const auto aggregate_start = std::chrono::steady_clock::now();
         auto aggregate_result = aggregate(
             current, workspace, options.parts, level_seed,
-            level, stats, diagnostics, options.cluster_size_factor, options.pack_isolated,options.max_lp_rounds,options.similarity_order);
+            level, stats, diagnostics, options.cluster_size_factor, options.pack_isolated);
         const auto level_aggregate_wall = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - aggregate_start).count();
         device_algorithm_seconds += level_aggregate_wall;
@@ -2210,7 +2176,7 @@ DeviceHierarchy<Types> coarsen(DeviceWeightedGraph<Types>&& graph, const Coarsen
 template class SclpWorkspace<ActiveTypes>;
 template DeviceAggregateResult<ActiveTypes> aggregate<ActiveTypes>(
     const DeviceWeightedGraph<ActiveTypes>&, SclpWorkspace<ActiveTypes>&,
-    int, std::uint32_t, int, SclpStats&, bool, int, bool, int, bool);
+    int, std::uint32_t, int, SclpStats&, bool, int, bool);
 template DeviceWeightedGraph<ActiveTypes> contract<ActiveTypes>(
     DeviceWeightedGraph<ActiveTypes>, DeviceAggregateResult<ActiveTypes>&&,
     SclpWorkspace<ActiveTypes>&, ContractionTimings&);

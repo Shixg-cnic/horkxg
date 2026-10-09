@@ -151,7 +151,6 @@ __global__ void assign_split(int count, const int* order, int boundary,
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) labels[order[i]] = i < boundary ? left : right;
 }
-
 template <typename O, typename W>
 __global__ void cut_terms(int n, const O* offsets, const int* neighbors,
     const W* weights, const int* labels, U64* terms) {
@@ -171,11 +170,11 @@ __global__ void part_weights(int n, const int* labels, const U64* weights, U64* 
 template <typename Types>
 thrust::device_vector<typename Types::VertexT> initial_partition_gpu(
     const DeviceWeightedGraph<Types>& graph, int parts, double imbalance,
-    std::uint32_t seed,int diffusion_steps) {
+    std::uint32_t seed) {
     const auto start = std::chrono::steady_clock::now();
     const auto n64 = graph.vertices();
     if (n64 <= 0 || n64 > std::numeric_limits<int>::max() - 255 || parts < 2 ||
-        parts > n64 || parts > 32 || diffusion_steps<1 || diffusion_steps>512 ||
+        parts > n64 || parts > 32 ||
         !std::isfinite(imbalance) || imbalance < 1.0)
         throw std::invalid_argument("invalid GPU initial partition input");
     int n = static_cast<int>(n64);
@@ -216,10 +215,10 @@ thrust::device_vector<typename Types::VertexT> initial_partition_gpu(
         CUDA_CHECK(cudaGetLastError());
         // Fixed work, no parameter sweep. Remove the stationary component at
         // every iteration; lazy diffusion suppresses high-frequency modes.
-        for (int iteration = 0; iteration <= diffusion_steps; ++iteration) {
+        for (int iteration = 0; iteration <= 64; ++iteration) {
             normalize<<<blocks, 256>>>(count, ids, ptr(x), ptr(norm));
             CUDA_CHECK(cudaGetLastError());
-            if (iteration == diffusion_steps) break;
+            if (iteration == 64) break;
             spectral_step<<<spectral_blocks, 256>>>(count, ids, ptr(labels),
                 task.first_part, ptr(graph.offsets), ptr(graph.neighbors),
                 ptr(graph.edge_weights), ptr(degree), ptr(x), ptr(y), ptr(partials));
@@ -231,18 +230,14 @@ thrust::device_vector<typename Types::VertexT> initial_partition_gpu(
         thrust::sort(begin, begin + count, SpectralOrder{ptr(x)});
         thrust::gather(begin, begin + count, vertex_weights.begin(), ordered_weights.begin());
         thrust::inclusive_scan(ordered_weights.begin(), ordered_weights.begin() + count, prefix.begin());
-        int left_parts = task.parts / 2, right_parts = task.parts - left_parts;
-        U64 target = static_cast<U64>(static_cast<long double>(task.weight) * left_parts / task.parts);
-        int boundary = static_cast<int>(thrust::lower_bound(prefix.begin(), prefix.begin() + count,
-            target) - prefix.begin()) + 1;
+        const int left_parts = task.parts / 2, right_parts = task.parts - left_parts;
+        const U64 target = static_cast<U64>(static_cast<long double>(task.weight) * left_parts / task.parts);
+        const U64 left_limit = capacity > task.weight / left_parts ? task.weight : capacity * left_parts;
+        const U64 right_limit = capacity > task.weight / right_parts ? task.weight : capacity * right_parts;
+        const U64 min_left = task.weight > right_limit ? task.weight - right_limit : 0;
+        int boundary = static_cast<int>(thrust::lower_bound(prefix.begin(), prefix.begin() + count, target) - prefix.begin()) + 1;
         boundary = std::max(left_parts, std::min(count - right_parts, boundary));
         U64 left_weight = prefix[boundary - 1];
-        // Check a prefix near the target (whole vertices, never fractional
-        // weights). Reject infeasible spectral ordering explicitly, no silent
-        // over-capacity initialization or hidden CPU/METIS fallback.
-        U64 left_limit = capacity > task.weight / left_parts ? task.weight : capacity * left_parts;
-        U64 right_limit = capacity > task.weight / right_parts ? task.weight : capacity * right_parts;
-        U64 min_left = task.weight > right_limit ? task.weight - right_limit : 0;
         if (left_weight > left_limit && boundary > left_parts) {
             --boundary; left_weight = prefix[boundary - 1];
         }
@@ -274,7 +269,6 @@ thrust::device_vector<typename Types::VertexT> initial_partition_gpu(
         << "coarsest_vertices=" << n << '\n'
         << "coarsest_edge_entries=" << graph.edges() << '\n'
         << "initial_partition_parts=" << parts << '\n'
-        << "initial_partition_diffusion_steps=" << diffusion_steps << '\n'
         << "initial_partition_edgecut=" << cut << '\n'
         << "initial_partition_seconds=" << std::chrono::duration<double>(
             std::chrono::steady_clock::now() - start).count() << '\n';
@@ -282,5 +276,5 @@ thrust::device_vector<typename Types::VertexT> initial_partition_gpu(
 }
 
 template thrust::device_vector<ActiveTypes::VertexT> initial_partition_gpu<ActiveTypes>(
-    const DeviceWeightedGraph<ActiveTypes>&, int, double, std::uint32_t,int);
+    const DeviceWeightedGraph<ActiveTypes>&, int, double, std::uint32_t);
 } // namespace gpart

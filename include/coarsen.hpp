@@ -21,8 +21,6 @@ struct CoarsenOptions {
     // Cluster capacity is ceil(total_weight / (cluster_size_factor * parts)).
     int cluster_size_factor = kBeta;
     bool pack_isolated = false;
-    int max_lp_rounds = 4;
-    bool similarity_order = false;
 };
 
 template <typename Types>
@@ -84,8 +82,7 @@ DeviceAggregateResult<Types> aggregate(
     const DeviceWeightedGraph<Types>& graph, SclpWorkspace<Types>& workspace,
     int parts, std::uint32_t seed,
     int level, SclpStats& stats, bool diagnostics,
-    int cluster_size_factor = kBeta, bool pack_isolated = false,
-    int max_lp_rounds = 4, bool similarity_order = false);
+    int cluster_size_factor = kBeta, bool pack_isolated = false);
 
 template <typename Types>
 DeviceWeightedGraph<Types> contract(

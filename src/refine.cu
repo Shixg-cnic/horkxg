@@ -13,13 +13,10 @@
 #include <limits>
 #include <numeric>
 #include <stdexcept>
-#include <string>
 #include <utility>
 #include <vector>
 
-#include <cub/device/device_radix_sort.cuh>
 #include <cub/block/block_scan.cuh>
-#include <cuda/std/tuple>
 #include <thrust/copy.h>
 #include <thrust/count.h>
 #include <thrust/device_vector.h>
@@ -29,7 +26,6 @@
 #include <thrust/functional.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/reduce.h>
-#include <thrust/scan.h>
 #include <thrust/transform_reduce.h>
 
 namespace gpart {
@@ -47,398 +43,11 @@ __device__ __forceinline__ std::uint32_t refine_mix32(std::uint32_t x) {
     return x ^ (x >> 16);
 }
 
-struct RefineAdmissionKey {
-    std::uint32_t target;
-    std::uint64_t reverse_gain;
-    std::uint32_t reverse_tie;
-    std::uint32_t vertex;
-};
-
-struct RefineAdmissionKeyDecomposer {
-    __host__ __device__ auto operator()(RefineAdmissionKey& key) const {
-        return cuda::std::tie(
-            key.target, key.reverse_gain, key.reverse_tie, key.vertex);
-    }
-};
-
-struct ValidRefineProposal {
-    __host__ __device__ bool operator()(const RefineAdmissionKey& key) const {
-        return key.target != kInvalidTarget;
-    }
-};
-
-struct PairAdmissionKey {
-    std::uint32_t target;
-    std::uint64_t reverse_gain;
-    std::uint32_t reverse_tie;
-    std::uint32_t owner;
-    std::uint32_t partner;
+// Rebalancing proposals are grouped by overloaded source and loss per unit weight.
+struct RebalanceProposal {
     std::uint32_t source;
-    std::uint64_t combined_weight;
+    double gain_per_weight;
 };
-
-struct PairAdmissionKeyDecomposer {
-    __host__ __device__ auto operator()(PairAdmissionKey& key) const {
-        return cuda::std::tie(
-            key.target, key.reverse_gain, key.reverse_tie, key.owner);
-    }
-};
-
-struct ValidPairProposal {
-    __host__ __device__ bool operator()(const PairAdmissionKey& key) const {
-        return key.target != kInvalidTarget;
-    }
-};
-
-__device__ __forceinline__ std::uint32_t pair_tie(
-    std::uint32_t first, std::uint32_t second,
-    std::uint32_t target, std::uint32_t salt) {
-    const auto low = min(first, second);
-    const auto high = max(first, second);
-    return refine_mix32(
-        refine_mix32(low) ^ refine_mix32(high) ^
-        refine_mix32(target) ^ salt);
-}
-
-template <typename OffsetT, typename WeightT, typename VertexT>
-__global__ void pair_target_kernel(
-    std::int64_t n,
-    const OffsetT* offsets,
-    const VertexT* neighbors,
-    const WeightT* edge_weights,
-    const VertexT* partition,
-    int parts,
-    std::uint32_t tie_salt,
-    std::uint32_t* targets,
-    std::int64_t* signed_gains) {
-    extern __shared__ unsigned long long shared_affinity[];
-    const int lane = threadIdx.x & (kWarpSize - 1);
-    const int warp_in_block = threadIdx.x / kWarpSize;
-    const auto vertex = static_cast<std::int64_t>(blockIdx.x) *
-        kWarpsPerBlock + warp_in_block;
-    if (vertex >= n) return;
-    auto* affinity = shared_affinity + warp_in_block * kWarpSize;
-    affinity[lane] = 0;
-    __syncwarp();
-
-    const auto source = partition[vertex];
-    bool boundary = false;
-    for (auto edge = offsets[vertex] + lane;
-         edge < offsets[vertex + 1]; edge += kWarpSize) {
-        const auto neighbor_part = partition[neighbors[edge]];
-        boundary = boundary || neighbor_part != source;
-        atomicAdd(
-            affinity + static_cast<int>(neighbor_part),
-            static_cast<unsigned long long>(edge_weights[edge]));
-    }
-    const unsigned boundary_mask = __ballot_sync(0xffffffffU, boundary);
-    __syncwarp();
-
-    if (lane == 0) {
-        std::uint32_t target = kInvalidTarget;
-        std::int64_t gain = 0;
-        if (boundary_mask != 0) {
-            unsigned long long best_affinity = 0;
-            std::uint32_t best_tie = 0;
-            int best_target = -1;
-            for (int candidate = 0; candidate < parts; ++candidate) {
-                if (candidate == source) continue;
-                const auto value = affinity[candidate];
-                const auto tie = refine_mix32(
-                    static_cast<std::uint32_t>(vertex) ^
-                    refine_mix32(static_cast<std::uint32_t>(candidate)) ^
-                    tie_salt);
-                if (value > best_affinity ||
-                    (value == best_affinity && value != 0 &&
-                     (tie > best_tie ||
-                      (tie == best_tie && candidate < best_target)))) {
-                    best_affinity = value;
-                    best_tie = tie;
-                    best_target = candidate;
-                }
-            }
-            if (best_target >= 0) {
-                target = static_cast<std::uint32_t>(best_target);
-                const auto current = affinity[source];
-                gain = best_affinity >= current
-                    ? static_cast<std::int64_t>(best_affinity - current)
-                    : -static_cast<std::int64_t>(current - best_affinity);
-            }
-        }
-        targets[vertex] = target;
-        signed_gains[vertex] = gain;
-    }
-}
-
-// Both paths reduce the same total ordering as the serial adjacency scan.
-// Low degree rows use four lanes; medium and hub rows use a full warp,
-// with hubs visited in coalesced, strided chunks.
-template <int Lanes, typename OffsetT, typename WeightT, typename VertexT>
-__global__ void pair_partner_kernel(
-    std::int64_t n,
-    const OffsetT* offsets,
-    const VertexT* neighbors,
-    const WeightT* edge_weights,
-    const VertexT* partition,
-    const std::uint32_t* targets,
-    const std::int64_t* signed_gains,
-    std::uint32_t tie_salt,
-    VertexT* best_partners,
-    std::int64_t* best_pair_gains,
-    std::uint64_t* candidate_counts) {
-    const int lane = threadIdx.x % Lanes;
-    const auto vertex = (static_cast<std::int64_t>(blockIdx.x) *
-        blockDim.x + threadIdx.x) / Lanes;
-    if (vertex >= n) return;
-    const auto begin = static_cast<std::int64_t>(offsets[vertex]);
-    const auto end = static_cast<std::int64_t>(offsets[vertex + 1]);
-    if ((end - begin <= 32) != (Lanes == 4)) return;
-    const unsigned mask = (0xffffffffU >> (32 - Lanes)) <<
-        ((threadIdx.x & 31) / Lanes * Lanes);
-    const auto source = partition[vertex];
-    const auto target = targets[vertex];
-    VertexT best_partner = VertexT{-1};
-    std::int64_t best_gain = 0;
-    std::uint32_t best_tie = 0;
-    std::uint64_t candidates = 0;
-    if (target != kInvalidTarget) {
-        for (auto edge = begin + lane; edge < end; edge += Lanes) {
-            const auto neighbor = neighbors[edge];
-            if (neighbor == vertex || partition[neighbor] != source ||
-                targets[neighbor] != target ||
-                (signed_gains[vertex] > 0 && signed_gains[neighbor] > 0)) {
-                continue;
-            }
-            const auto pair_gain = signed_gains[vertex] +
-                signed_gains[neighbor] +
-                2 * static_cast<std::int64_t>(edge_weights[edge]);
-            if (pair_gain <= 0) continue;
-            ++candidates;
-            const auto tie = pair_tie(
-                static_cast<std::uint32_t>(vertex),
-                static_cast<std::uint32_t>(neighbor), target, tie_salt);
-            if (pair_gain > best_gain ||
-                (pair_gain == best_gain &&
-                 (tie > best_tie ||
-                  (tie == best_tie && neighbor < best_partner)))) {
-                best_gain = pair_gain;
-                best_tie = tie;
-                best_partner = neighbor;
-            }
-        }
-    }
-    for (int delta = Lanes / 2; delta > 0; delta /= 2) {
-        const auto other_gain = static_cast<std::int64_t>(__shfl_down_sync(
-            mask, static_cast<long long>(best_gain), delta, Lanes));
-        const auto other_tie = __shfl_down_sync(mask, best_tie, delta, Lanes);
-        const auto other_partner = __shfl_down_sync(
-            mask, best_partner, delta, Lanes);
-        const auto other_count = static_cast<std::uint64_t>(__shfl_down_sync(
-            mask, static_cast<unsigned long long>(candidates), delta, Lanes));
-        if (lane + delta < Lanes) {
-            candidates += other_count;
-            if (other_gain > best_gain ||
-                (other_gain == best_gain &&
-                 (other_tie > best_tie ||
-                  (other_tie == best_tie && other_partner < best_partner)))) {
-                best_gain = other_gain;
-                best_tie = other_tie;
-                best_partner = other_partner;
-            }
-        }
-    }
-    if (lane == 0) {
-        best_partners[vertex] = best_partner;
-        best_pair_gains[vertex] = best_gain;
-        candidate_counts[vertex] = candidates;
-    }
-}
-
-template <typename WeightT, typename VertexT>
-__global__ void mutual_pair_proposal_kernel(
-    std::int64_t n,
-    const VertexT* partition,
-    const WeightT* vertex_weights,
-    const std::uint32_t* targets,
-    const VertexT* best_partners,
-    const std::int64_t* best_pair_gains,
-    std::uint32_t tie_salt,
-    PairAdmissionKey* proposals) {
-    const auto vertex = static_cast<std::int64_t>(blockIdx.x) *
-        blockDim.x + threadIdx.x;
-    if (vertex >= n) return;
-    PairAdmissionKey proposal{
-        kInvalidTarget, ~std::uint64_t{0}, ~std::uint32_t{0},
-        static_cast<std::uint32_t>(vertex), 0, 0, 0};
-    const auto partner = best_partners[vertex];
-    if (partner >= 0 && vertex < partner &&
-        best_partners[partner] == vertex) {
-        const auto target = targets[vertex];
-        const auto combined =
-            static_cast<std::uint64_t>(vertex_weights[vertex]) +
-            static_cast<std::uint64_t>(vertex_weights[partner]);
-        proposal.target = target;
-        proposal.reverse_gain = ~static_cast<std::uint64_t>(
-            best_pair_gains[vertex]);
-        proposal.reverse_tie = ~pair_tie(
-            static_cast<std::uint32_t>(vertex),
-            static_cast<std::uint32_t>(partner), target, tie_salt);
-        proposal.partner = static_cast<std::uint32_t>(partner);
-        proposal.source = static_cast<std::uint32_t>(partition[vertex]);
-        proposal.combined_weight = combined;
-    }
-    proposals[vertex] = proposal;
-}
-
-__global__ void decode_pair_proposals_kernel(
-    std::int64_t count,
-    const PairAdmissionKey* proposals,
-    std::int32_t* targets,
-    std::uint64_t* weights) {
-    const auto i = static_cast<std::int64_t>(blockIdx.x) *
-        blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    targets[i] = static_cast<std::int32_t>(proposals[i].target);
-    weights[i] = proposals[i].combined_weight;
-}
-
-template <typename VertexT>
-__global__ void pair_commit_kernel(
-    std::int64_t count,
-    const PairAdmissionKey* proposals,
-    const std::int32_t* accepted,
-    VertexT* partition,
-    unsigned long long* part_weights) {
-    const auto i = static_cast<std::int64_t>(blockIdx.x) *
-        blockDim.x + threadIdx.x;
-    if (i >= count || accepted[i] == 0) return;
-    const auto proposal = proposals[i];
-    const auto target = static_cast<VertexT>(proposal.target);
-    partition[proposal.owner] = target;
-    partition[proposal.partner] = target;
-    atomicAdd(part_weights + proposal.source, 0ULL - proposal.combined_weight);
-    atomicAdd(part_weights + proposal.target, proposal.combined_weight);
-}
-
-template <typename OffsetT, typename WeightT, typename VertexT>
-__global__ void refine_proposal_kernel(
-    std::int64_t n,
-    const OffsetT* offsets,
-    const VertexT* neighbors,
-    const WeightT* edge_weights,
-    const VertexT* partition,
-    int parts,
-    std::uint32_t tie_salt,
-    RefineAdmissionKey* proposals) {
-    extern __shared__ unsigned long long shared_affinity[];
-    const int lane = threadIdx.x & (kWarpSize - 1);
-    const int warp_in_block = threadIdx.x / kWarpSize;
-    const auto vertex = static_cast<std::int64_t>(blockIdx.x) *
-        kWarpsPerBlock + warp_in_block;
-    if (vertex >= n) return;
-    auto* affinity = shared_affinity + warp_in_block * kWarpSize;
-    affinity[lane] = 0;
-    __syncwarp();
-
-    const auto current_part = partition[vertex];
-    bool boundary = false;
-    for (auto edge = offsets[vertex] + lane;
-         edge < offsets[vertex + 1]; edge += kWarpSize) {
-        const auto neighbor_part = partition[neighbors[edge]];
-        boundary = boundary || neighbor_part != current_part;
-        atomicAdd(
-            affinity + static_cast<int>(neighbor_part),
-            static_cast<unsigned long long>(edge_weights[edge]));
-    }
-    const unsigned boundary_mask = __ballot_sync(0xffffffffU, boundary);
-    __syncwarp();
-
-    if (lane == 0) {
-        RefineAdmissionKey key{
-            kInvalidTarget, ~std::uint64_t{0}, ~std::uint32_t{0},
-            static_cast<std::uint32_t>(vertex)};
-        if (boundary_mask != 0) {
-            const auto current_affinity = affinity[current_part];
-            unsigned long long best_affinity = 0;
-            std::uint32_t best_tie = 0;
-            int best_target = -1;
-            for (int target = 0; target < parts; ++target) {
-                if (target == current_part) continue;
-                const auto value = affinity[target];
-                const auto tie = refine_mix32(
-                    static_cast<std::uint32_t>(vertex) ^
-                    refine_mix32(static_cast<std::uint32_t>(target)) ^
-                    tie_salt);
-                if (value > best_affinity ||
-                    (value == best_affinity && value != 0 &&
-                     (tie > best_tie ||
-                      (tie == best_tie && target < best_target)))) {
-                    best_affinity = value;
-                    best_tie = tie;
-                    best_target = target;
-                }
-            }
-            if (best_target >= 0 && best_affinity > current_affinity) {
-                const auto gain = best_affinity - current_affinity;
-                key.target = static_cast<std::uint32_t>(best_target);
-                key.reverse_gain = ~static_cast<std::uint64_t>(gain);
-                key.reverse_tie = ~best_tie;
-            }
-        }
-        proposals[vertex] = key;
-    }
-}
-
-template <typename WeightT>
-__global__ void decode_refine_proposals_kernel(
-    std::int64_t count,
-    const RefineAdmissionKey* proposals,
-    const WeightT* vertex_weights,
-    std::int32_t* targets,
-    std::uint64_t* weights) {
-    const auto i = static_cast<std::int64_t>(blockIdx.x) *
-        blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    targets[i] = static_cast<std::int32_t>(proposals[i].target);
-    weights[i] = static_cast<std::uint64_t>(
-        vertex_weights[proposals[i].vertex]);
-}
-
-__global__ void refine_admission_kernel(
-    std::int64_t count,
-    const std::int32_t* targets,
-    const std::uint64_t* prefix_weights,
-    const unsigned long long* part_weights,
-    std::uint64_t capacity,
-    std::int32_t* accepted) {
-    const auto i = static_cast<std::int64_t>(blockIdx.x) *
-        blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    const auto target = targets[i];
-    const auto base = static_cast<std::uint64_t>(part_weights[target]);
-    accepted[i] = base <= capacity && prefix_weights[i] <= capacity - base
-        ? 1 : 0;
-}
-
-template <typename VertexT, typename WeightT>
-__global__ void refine_commit_kernel(
-    std::int64_t count,
-    const RefineAdmissionKey* proposals,
-    const std::int32_t* accepted,
-    const WeightT* vertex_weights,
-    VertexT* partition,
-    unsigned long long* part_weights) {
-    const auto i = static_cast<std::int64_t>(blockIdx.x) *
-        blockDim.x + threadIdx.x;
-    if (i >= count || accepted[i] == 0) return;
-    const auto vertex = proposals[i].vertex;
-    const auto source = partition[vertex];
-    const auto target = static_cast<VertexT>(proposals[i].target);
-    const auto weight = static_cast<unsigned long long>(vertex_weights[vertex]);
-    atomicAdd(part_weights + source, 0ULL - weight);
-    atomicAdd(part_weights + target, weight);
-    partition[vertex] = target;
-}
 
 template <typename OffsetT, typename WeightT, typename VertexT>
 __global__ void refine_cut_kernel(
@@ -591,21 +200,7 @@ public:
     detail::ScratchVector<VertexT> previous_partition;
     detail::ScratchVector<unsigned long long> previous_part_weights;
     thrust::device_vector<unsigned long long> cut_counter;
-    detail::ScratchVector<RefineAdmissionKey> proposal_keys;
-    detail::ScratchVector<RefineAdmissionKey> compact_keys;
-    detail::ScratchVector<RefineAdmissionKey> sorted_keys;
-    detail::ScratchVector<PairAdmissionKey> pair_proposal_keys;
-    detail::ScratchVector<PairAdmissionKey> pair_compact_keys;
-    detail::ScratchVector<PairAdmissionKey> pair_sorted_keys;
-    detail::ScratchVector<std::uint32_t> pair_targets;
-    detail::ScratchVector<std::int64_t> signed_gains;
-    detail::ScratchVector<VertexT> best_partners;
-    detail::ScratchVector<std::int64_t> best_pair_gains;
-    detail::ScratchVector<std::uint64_t> candidate_counts;
-    detail::ScratchVector<std::int32_t> ordered_targets;
-    detail::ScratchVector<std::uint64_t> ordered_weights;
-    detail::ScratchVector<std::uint64_t> prefix_weights;
-    detail::ScratchVector<std::int32_t> accepted_flags;
+    detail::ScratchVector<RebalanceProposal> rebalance_proposals;
     detail::ScratchVector<std::uint64_t> dense_affinity;
     detail::ScratchVector<std::int32_t> incremental_targets;
     detail::ScratchVector<std::int64_t> incremental_gains;
@@ -617,7 +212,6 @@ public:
     detail::ScratchVector<std::uint64_t> balance_bucket_ranks;
     detail::ScratchVector<unsigned long long> balance_bucket_counts;
     detail::ScratchVector<unsigned long long> balance_bucket_offsets;
-    detail::ScratchVector<std::uint8_t> radix_temp;
     double resize_seconds = 0.0;
 
     template <typename T, typename Allocator>
@@ -634,37 +228,7 @@ public:
         grow(previous_partition, vertices);
         grow(previous_part_weights, parts);
         grow(cut_counter, 1);
-        grow(proposal_keys, vertices);
-        grow(compact_keys, vertices);
-    }
-
-    void reserve_radix(std::size_t bytes) { grow(radix_temp, bytes); }
-
-    void reserve_admission(std::size_t count) {
-        grow(ordered_targets, count);
-        grow(ordered_weights, count);
-        grow(prefix_weights, count);
-        grow(accepted_flags, count);
-    }
-
-    void reserve_plain_sorted(std::size_t count) {
-        grow(sorted_keys, count);
-        reserve_admission(count);
-    }
-
-    void reserve_pair_vertices(std::size_t count) {
-        grow(pair_targets, count);
-        grow(signed_gains, count);
-        grow(best_partners, count);
-        grow(best_pair_gains, count);
-        grow(candidate_counts, count);
-        grow(pair_proposal_keys, count);
-        grow(pair_compact_keys, count);
-    }
-
-    void reserve_pair_sorted(std::size_t count) {
-        grow(pair_sorted_keys, count);
-        reserve_admission(count);
+        grow(rebalance_proposals, vertices);
     }
 };
 
@@ -696,7 +260,6 @@ public:
             options.max_rounds < 0 || options.max_rounds > 64 ||
             options.stale_rounds < 1 || options.stale_rounds > 64 ||
             !std::isfinite(options.refinement_growth_ratio) || options.refinement_growth_ratio < 1.0 ||
-            options.swap_rounds < 0 || options.swap_rounds > 64 ||
             !std::isfinite(options.imbalance_ratio) ||
             options.imbalance_ratio < 1.0 || n <= 0) {
             throw std::invalid_argument("invalid refinement options");
@@ -781,156 +344,7 @@ public:
 };
 
 template <typename Types>
-RefineStats run_incremental_refinement(RefineDeviceContext<Types>&,
-    const RefineOptions&, int,std::uint64_t checkpoint_cut=UINT64_MAX);
-
-template <typename Types>
-RefineStats run_plain_refinement(
-    RefineDeviceContext<Types>& context,
-    const RefineOptions& options,
-    int rounds) {
-    if (options.incremental) return run_incremental_refinement(context, options, rounds);
-    const auto start = std::chrono::steady_clock::now();
-    auto& device_graph = context.graph;
-    auto& device_partition = context.partition;
-    auto& previous_partition = context.workspace.previous_partition;
-    auto& part_weights = context.part_weights;
-    auto& previous_part_weights = context.workspace.previous_part_weights;
-    auto& proposal_keys = context.workspace.proposal_keys;
-    auto& compact_keys = context.workspace.compact_keys;
-    auto& sorted_keys = context.workspace.sorted_keys;
-    auto& ordered_targets = context.workspace.ordered_targets;
-    auto& ordered_weights = context.workspace.ordered_weights;
-    auto& prefix_weights = context.workspace.prefix_weights;
-    auto& accepted_flags = context.workspace.accepted_flags;
-    auto& radix_temp = context.workspace.radix_temp;
-    auto& host_part_weights = context.host_part_weights;
-    const auto capacity = context.capacity;
-    const auto n = context.n;
-    const auto vertex_blocks = context.vertex_blocks;
-    const auto warp_blocks = context.warp_blocks;
-    const auto device_cut = [&]() { return context.cut(); };
-
-    RefineStats stats;
-    stats.initial_cut = device_cut();
-    auto current_cut = stats.initial_cut;
-    for (int round = 0; round < rounds; ++round) {
-        const auto round_start_cut = current_cut;
-        stats.rounds = round + 1;
-        thrust::copy(
-            device_partition.begin(), device_partition.end(),
-            previous_partition.begin());
-        thrust::copy(
-            part_weights.begin(), part_weights.end(),
-            previous_part_weights.begin());
-        const auto tie_salt = options.seed ^
-            (static_cast<std::uint32_t>(round) * 0x9e3779b9U) ^ 0x85ebca6bU;
-        constexpr std::size_t shared_bytes =
-            kWarpsPerBlock * kWarpSize * sizeof(unsigned long long);
-        refine_proposal_kernel<<<warp_blocks, 256, shared_bytes>>>(
-            n,
-            thrust::raw_pointer_cast(device_graph.offsets.data()),
-            thrust::raw_pointer_cast(device_graph.neighbors.data()),
-            thrust::raw_pointer_cast(device_graph.edge_weights.data()),
-            thrust::raw_pointer_cast(device_partition.data()),
-            options.parts, tie_salt,
-            thrust::raw_pointer_cast(proposal_keys.data()));
-        CUDA_CHECK(cudaGetLastError());
-        const auto compact_end = thrust::copy_if(
-            thrust::device, proposal_keys.begin(), proposal_keys.begin() + n,
-            compact_keys.begin(), ValidRefineProposal{});
-        const auto proposal_count = static_cast<std::int64_t>(
-            compact_end - compact_keys.begin());
-        stats.proposals += static_cast<std::uint64_t>(proposal_count);
-        if (proposal_count == 0) break;
-        context.workspace.reserve_plain_sorted(
-            static_cast<std::size_t>(proposal_count));
-
-        std::size_t radix_bytes = 0;
-        CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
-            nullptr, radix_bytes,
-            thrust::raw_pointer_cast(compact_keys.data()),
-            thrust::raw_pointer_cast(sorted_keys.data()),
-            static_cast<int>(proposal_count),
-            RefineAdmissionKeyDecomposer{}));
-        context.workspace.reserve_radix(radix_bytes);
-        auto call_bytes = radix_bytes;
-        CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
-            thrust::raw_pointer_cast(radix_temp.data()), call_bytes,
-            thrust::raw_pointer_cast(compact_keys.data()),
-            thrust::raw_pointer_cast(sorted_keys.data()),
-            static_cast<int>(proposal_count),
-            RefineAdmissionKeyDecomposer{}));
-        const int proposal_blocks = static_cast<int>(
-            (proposal_count + 255) / 256);
-        decode_refine_proposals_kernel<<<proposal_blocks, 256>>>(
-            proposal_count,
-            thrust::raw_pointer_cast(sorted_keys.data()),
-            thrust::raw_pointer_cast(device_graph.vertex_weights.data()),
-            thrust::raw_pointer_cast(ordered_targets.data()),
-            thrust::raw_pointer_cast(ordered_weights.data()));
-        CUDA_CHECK(cudaGetLastError());
-        thrust::inclusive_scan_by_key(thrust::device,
-            ordered_targets.begin(), ordered_targets.begin()+proposal_count,
-            ordered_weights.begin(), prefix_weights.begin());
-        refine_admission_kernel<<<proposal_blocks, 256>>>(proposal_count,
-            thrust::raw_pointer_cast(ordered_targets.data()),
-            thrust::raw_pointer_cast(prefix_weights.data()),
-            thrust::raw_pointer_cast(part_weights.data()),
-            options.incremental && options.pair_allow_overload ? UINT64_MAX:capacity,
-            thrust::raw_pointer_cast(accepted_flags.data()));
-        CUDA_CHECK(cudaGetLastError());
-        const auto accepted_count = static_cast<std::uint64_t>(thrust::count(
-            accepted_flags.begin(), accepted_flags.begin() + proposal_count,
-            std::int32_t{1}));
-        if (accepted_count == 0) break;
-
-        refine_commit_kernel<<<proposal_blocks, 256>>>(
-            proposal_count,
-            thrust::raw_pointer_cast(sorted_keys.data()),
-            thrust::raw_pointer_cast(accepted_flags.data()),
-            thrust::raw_pointer_cast(device_graph.vertex_weights.data()),
-            thrust::raw_pointer_cast(device_partition.data()),
-            thrust::raw_pointer_cast(part_weights.data()));
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaDeviceSynchronize());
-        context.sync_part_weights();
-        if (*std::max_element(
-                host_part_weights.begin(), host_part_weights.end()) > capacity) {
-            throw std::runtime_error("refinement admission violated balance");
-        }
-        const auto next_cut = device_cut();
-        if (next_cut > current_cut) {
-            ++stats.rollback_rounds;
-            thrust::copy(
-                previous_partition.begin(), previous_partition.begin() + n,
-                device_partition.begin());
-            thrust::copy(
-                previous_part_weights.begin(),
-                previous_part_weights.begin() + part_weights.size(),
-                part_weights.begin());
-            break;
-        }
-        stats.accepted += accepted_count;
-        current_cut = next_cut;
-        if (next_cut == round_start_cut) break;
-    }
-
-    context.sync_part_weights();
-    stats.final_cut = device_cut();
-    stats.final_max_part_weight = *std::max_element(
-        host_part_weights.begin(), host_part_weights.end());
-    if (stats.final_cut > stats.initial_cut ||
-        stats.final_max_part_weight > capacity) {
-        throw std::runtime_error("refinement postcondition failed");
-    }
-    stats.seconds = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - start).count();
-    return stats;
-}
-
-template <typename Types>
-void validate_pair_gain_range(const WeightedGraph<Types>& graph) {
+void validate_refinement_gain_range(const WeightedGraph<Types>& graph) {
     constexpr auto signed_limit = static_cast<std::uint64_t>(
         std::numeric_limits<std::int64_t>::max()) / 2;
     constexpr auto max_weight = static_cast<std::uint64_t>(
@@ -944,13 +358,13 @@ void validate_pair_gain_range(const WeightedGraph<Types>& graph) {
         if (weight > signed_limit ||
             directed_weight > signed_limit - weight) {
             throw std::overflow_error(
-                "pair refinement signed gain range exceeded");
+                "refinement signed gain range exceeded");
         }
         directed_weight += weight;
     }
 }
 
-struct PairWeightSum {
+struct RefinementWeightSum {
     __host__ __device__ std::uint64_t operator()(std::uint64_t a, std::uint64_t b) const {
         constexpr auto limit = std::uint64_t(INT64_MAX) / 2;
         return a > limit || b > limit || a > limit - b ? limit + 1 : a + b;
@@ -958,13 +372,13 @@ struct PairWeightSum {
 };
 
 template <typename Types>
-void validate_pair_gain_range(const DeviceWeightedGraph<Types>& graph) {
+void validate_refinement_gain_range(const DeviceWeightedGraph<Types>& graph) {
     constexpr auto limit = std::uint64_t(INT64_MAX) / 2;
     constexpr auto max_weight = std::numeric_limits<typename Types::WeightT>::max();
     if (graph.edge_weights.size() <= limit / max_weight) return;
     if (thrust::reduce(graph.edge_weights.begin(), graph.edge_weights.end(),
-                       std::uint64_t{0}, PairWeightSum{}) > limit) {
-        throw std::overflow_error("pair refinement signed gain range exceeded");
+                       std::uint64_t{0}, RefinementWeightSum{}) > limit) {
+        throw std::overflow_error("refinement signed gain range exceeded");
     }
 }
 
@@ -994,185 +408,6 @@ struct ToCheckedWeight {
 #include "refine_incremental.cuh"
 
 template <typename Types>
-PairRefineStats run_pair_escape(
-    RefineDeviceContext<Types>& context,
-    const RefineOptions& options,
-    int level) {
-    using VertexT = typename Types::VertexT;
-
-    auto& host_part_weights = context.host_part_weights;
-    const auto capacity = context.capacity;
-    if (*std::max_element(host_part_weights.begin(), host_part_weights.end()) >
-        capacity) {
-        throw std::invalid_argument("initial pair partition is imbalanced");
-    }
-
-    auto& device_graph = context.graph;
-    auto& device_partition = context.partition;
-    auto& previous_partition = context.workspace.previous_partition;
-    auto& part_weights = context.part_weights;
-    auto& previous_part_weights = context.workspace.previous_part_weights;
-    const auto n = context.n;
-    const auto vertex_blocks = context.vertex_blocks;
-    const auto warp_blocks = context.warp_blocks;
-    const auto device_cut = [&]() { return context.cut(); };
-    thrust::copy(
-        device_partition.begin(), device_partition.end(),
-        previous_partition.begin());
-    thrust::copy(
-        part_weights.begin(), part_weights.end(),
-        previous_part_weights.begin());
-
-    PairRefineStats stats;
-    stats.cut_before = device_cut();
-    stats.cut_after = stats.cut_before;
-    context.workspace.reserve_pair_vertices(static_cast<std::size_t>(n));
-    auto& targets = context.workspace.pair_targets;
-    auto& signed_gains = context.workspace.signed_gains;
-    const auto tie_salt = options.seed ^
-        (static_cast<std::uint32_t>(level) * 0x9e3779b9U) ^ 0x27d4eb2dU;
-    constexpr std::size_t shared_bytes =
-        kWarpsPerBlock * kWarpSize * sizeof(unsigned long long);
-    pair_target_kernel<<<warp_blocks, 256, shared_bytes>>>(
-        n,
-        thrust::raw_pointer_cast(device_graph.offsets.data()),
-        thrust::raw_pointer_cast(device_graph.neighbors.data()),
-        thrust::raw_pointer_cast(device_graph.edge_weights.data()),
-        thrust::raw_pointer_cast(device_partition.data()),
-        options.parts, tie_salt,
-        thrust::raw_pointer_cast(targets.data()),
-        thrust::raw_pointer_cast(signed_gains.data()));
-    CUDA_CHECK(cudaGetLastError());
-
-    auto& best_partners = context.workspace.best_partners;
-    auto& best_pair_gains = context.workspace.best_pair_gains;
-    auto& candidate_counts = context.workspace.candidate_counts;
-    pair_partner_kernel<4><<<static_cast<int>((n + 63) / 64), 256>>>(
-        n,
-        thrust::raw_pointer_cast(device_graph.offsets.data()),
-        thrust::raw_pointer_cast(device_graph.neighbors.data()),
-        thrust::raw_pointer_cast(device_graph.edge_weights.data()),
-        thrust::raw_pointer_cast(device_partition.data()),
-        thrust::raw_pointer_cast(targets.data()),
-        thrust::raw_pointer_cast(signed_gains.data()), tie_salt,
-        thrust::raw_pointer_cast(best_partners.data()),
-        thrust::raw_pointer_cast(best_pair_gains.data()),
-        thrust::raw_pointer_cast(candidate_counts.data()));
-    CUDA_CHECK(cudaGetLastError());
-    pair_partner_kernel<32><<<warp_blocks, 256>>>(
-        n,
-        thrust::raw_pointer_cast(device_graph.offsets.data()),
-        thrust::raw_pointer_cast(device_graph.neighbors.data()),
-        thrust::raw_pointer_cast(device_graph.edge_weights.data()),
-        thrust::raw_pointer_cast(device_partition.data()),
-        thrust::raw_pointer_cast(targets.data()),
-        thrust::raw_pointer_cast(signed_gains.data()), tie_salt,
-        thrust::raw_pointer_cast(best_partners.data()),
-        thrust::raw_pointer_cast(best_pair_gains.data()),
-        thrust::raw_pointer_cast(candidate_counts.data()));
-    CUDA_CHECK(cudaGetLastError());
-    const auto directed_candidates = thrust::reduce(
-        candidate_counts.begin(), candidate_counts.begin() + n, std::uint64_t{0});
-    if ((directed_candidates & 1ULL) != 0) {
-        throw std::runtime_error("pair candidates are not symmetric");
-    }
-    stats.candidates = directed_candidates / 2;
-
-    auto& proposal_keys = context.workspace.pair_proposal_keys;
-    auto& compact_keys = context.workspace.pair_compact_keys;
-    auto& sorted_keys = context.workspace.pair_sorted_keys;
-    mutual_pair_proposal_kernel<<<vertex_blocks, 256>>>(
-        n,
-        thrust::raw_pointer_cast(device_partition.data()),
-        thrust::raw_pointer_cast(device_graph.vertex_weights.data()),
-        thrust::raw_pointer_cast(targets.data()),
-        thrust::raw_pointer_cast(best_partners.data()),
-        thrust::raw_pointer_cast(best_pair_gains.data()), tie_salt,
-        thrust::raw_pointer_cast(proposal_keys.data()));
-    CUDA_CHECK(cudaGetLastError());
-    const auto compact_end = thrust::copy_if(
-        thrust::device, proposal_keys.begin(), proposal_keys.begin() + n,
-        compact_keys.begin(), ValidPairProposal{});
-    const auto pair_count = static_cast<std::int64_t>(
-        compact_end - compact_keys.begin());
-    stats.mutual_pairs = static_cast<std::uint64_t>(pair_count);
-
-    if (pair_count > 0) {
-        context.workspace.reserve_pair_sorted(static_cast<std::size_t>(pair_count));
-        std::size_t radix_bytes = 0;
-        CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
-            nullptr, radix_bytes,
-            thrust::raw_pointer_cast(compact_keys.data()),
-            thrust::raw_pointer_cast(sorted_keys.data()),
-            static_cast<int>(pair_count), PairAdmissionKeyDecomposer{}));
-        context.workspace.reserve_radix(radix_bytes);
-        auto call_bytes = radix_bytes;
-        CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
-            thrust::raw_pointer_cast(context.workspace.radix_temp.data()), call_bytes,
-            thrust::raw_pointer_cast(compact_keys.data()),
-            thrust::raw_pointer_cast(sorted_keys.data()),
-            static_cast<int>(pair_count), PairAdmissionKeyDecomposer{}));
-
-        auto& ordered_targets = context.workspace.ordered_targets;
-        auto& ordered_weights = context.workspace.ordered_weights;
-        auto& prefix_weights = context.workspace.prefix_weights;
-        auto& accepted_flags = context.workspace.accepted_flags;
-        const int pair_blocks = static_cast<int>((pair_count + 255) / 256);
-        decode_pair_proposals_kernel<<<pair_blocks, 256>>>(
-            pair_count, thrust::raw_pointer_cast(sorted_keys.data()),
-            thrust::raw_pointer_cast(ordered_targets.data()),
-            thrust::raw_pointer_cast(ordered_weights.data()));
-        CUDA_CHECK(cudaGetLastError());
-        thrust::inclusive_scan_by_key(
-            thrust::device,
-            ordered_targets.begin(), ordered_targets.begin() + pair_count,
-            ordered_weights.begin(), prefix_weights.begin());
-        refine_admission_kernel<<<pair_blocks, 256>>>(
-            pair_count,
-            thrust::raw_pointer_cast(ordered_targets.data()),
-            thrust::raw_pointer_cast(prefix_weights.data()),
-            thrust::raw_pointer_cast(part_weights.data()), capacity,
-            thrust::raw_pointer_cast(accepted_flags.data()));
-        CUDA_CHECK(cudaGetLastError());
-        stats.accepted = static_cast<std::uint64_t>(thrust::count(
-            accepted_flags.begin(), accepted_flags.begin() + pair_count,
-            std::int32_t{1}));
-
-        if (stats.accepted > 0) {
-            pair_commit_kernel<<<pair_blocks, 256>>>(
-                pair_count, thrust::raw_pointer_cast(sorted_keys.data()),
-                thrust::raw_pointer_cast(accepted_flags.data()),
-                thrust::raw_pointer_cast(device_partition.data()),
-                thrust::raw_pointer_cast(part_weights.data()));
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
-            context.sync_part_weights();
-            if (!(options.incremental && options.pair_allow_overload) && *std::max_element(
-                    host_part_weights.begin(), host_part_weights.end()) >
-                capacity) {
-                throw std::runtime_error(
-                    "pair admission violated partition capacity");
-            }
-            stats.cut_after = device_cut();
-            if (stats.cut_after > stats.cut_before) {
-                stats.rollback = true;
-                thrust::copy(
-                    previous_partition.begin(), previous_partition.begin() + n,
-                    device_partition.begin());
-                thrust::copy(
-                    previous_part_weights.begin(),
-                    previous_part_weights.begin() + part_weights.size(),
-                    part_weights.begin());
-                context.sync_part_weights();
-                stats.cut_after=stats.cut_before;
-            }
-        }
-    }
-
-    return stats;
-}
-
-template <typename Types>
 void refine_partition(
     const WeightedGraph<Types>& graph,
     std::vector<typename Types::VertexT>& partition,
@@ -1180,22 +415,7 @@ void refine_partition(
     RefineStats* output_stats) {
     RefineWorkspace<Types> workspace;
     RefineDeviceContext<Types> context(graph, partition, options, workspace);
-    auto stats = run_plain_refinement(context, options, options.max_rounds);
-    context.export_partition(partition);
-    if (output_stats != nullptr) *output_stats = stats;
-}
-
-template <typename Types>
-void coordinated_pair_escape(
-    const WeightedGraph<Types>& graph,
-    std::vector<typename Types::VertexT>& partition,
-    const RefineOptions& options,
-    int level,
-    PairRefineStats* output_stats) {
-    validate_pair_gain_range(graph);
-    RefineWorkspace<Types> workspace;
-    RefineDeviceContext<Types> context(graph, partition, options, workspace);
-    auto stats = run_pair_escape(context, options, level);
+    auto stats = run_incremental_refinement(context, options, options.max_rounds);
     context.export_partition(partition);
     if (output_stats != nullptr) *output_stats = stats;
 }
@@ -1208,7 +428,6 @@ DeviceUncoarsenResult<Types> refine_hierarchy_impl(
     if (options.parts < 2 || options.parts > 32 || options.max_rounds < 0 ||
         options.max_rounds > 64 || options.stale_rounds < 1 || options.stale_rounds > 64 ||
         !std::isfinite(options.refinement_growth_ratio) || options.refinement_growth_ratio < 1.0 ||
-        options.swap_rounds < 0 || options.swap_rounds > 64 ||
         !std::isfinite(options.imbalance_ratio) ||
         options.imbalance_ratio < 1.0) {
         throw std::invalid_argument("invalid refinement options");
@@ -1220,8 +439,8 @@ DeviceUncoarsenResult<Types> refine_hierarchy_impl(
     // Validate once before any refinement, including externally built
     // hierarchies; do not assume their coarse edge weights are bounded by
     // the original graph's weight sum.
-    for (std::size_t level = 0; level + 1 < hierarchy.levels.size(); ++level) {
-        validate_pair_gain_range(hierarchy.levels[level]);
+    for (std::size_t level = 0; level < hierarchy.levels.size(); ++level) {
+        validate_refinement_gain_range(hierarchy.levels[level]);
     }
     RefineWorkspace<Types> workspace;
     auto& coarsest = hierarchy.levels.back();
@@ -1266,7 +485,7 @@ DeviceUncoarsenResult<Types> refine_hierarchy_impl(
     result.levels.reserve(hierarchy.levels.size() - 1);
     std::uint64_t last_cut=0;
     auto last_refined_vertices=current_graph.vertices();
-    if (options.incremental) {
+    {
         RefineDeviceContext<Types> context(std::move(current_graph),
             std::move(current_partition), std::move(current_part_weights),
             current_host_weights, options, workspace);
@@ -1282,8 +501,6 @@ DeviceUncoarsenResult<Types> refine_hierarchy_impl(
         current_part_weights = std::move(context.part_weights);
         current_host_weights = context.host_part_weights;
     }
-    if (!options.incremental && hierarchy.levels.size() == 1)
-        last_cut=device_cut_value(current_graph, current_partition, cut_counter);
 
     for (std::size_t coarse_level = hierarchy.levels.size() - 1;
          coarse_level > 0; --coarse_level) {
@@ -1382,45 +599,24 @@ DeviceUncoarsenResult<Types> refine_hierarchy_impl(
             std::move(fine_graph), std::move(fine_partition),
             std::move(fine_part_weights), projected_weights, options, workspace);
         auto resize_before_stage = workspace.resize_seconds;
-        const bool refine_this_level = !options.incremental || fine_level==0 ||
+        const bool refine_this_level = fine_level==0 ||
             report.vertices>=options.refinement_growth_ratio*last_refined_vertices;
         if (refine_this_level) {
-            report.plain = run_plain_refinement(context, options, options.max_rounds);
+            report.refinement = run_incremental_refinement(context, options, options.max_rounds);
             last_refined_vertices=report.vertices;
         } else {
             // Projection preserves cut and part weights. Avoid rebuilding
             // the affinity cache when this level adds little resolution.
-            report.plain.initial_cut=report.plain.final_cut=last_cut;
-            report.plain.final_max_part_weight=report.projection_max_part_weight;
+            report.refinement.initial_cut=report.refinement.final_cut=last_cut;
+            report.refinement.final_max_part_weight=report.projection_max_part_weight;
         }
         if (!options.strict_verify) {
-            report.projection_cut = report.plain.initial_cut;
+            report.projection_cut = report.refinement.initial_cut;
         }
-        report.timings.plain_seconds = report.plain.seconds -
+        report.timings.refinement_seconds = report.refinement.seconds -
             (workspace.resize_seconds - resize_before_stage);
-        resize_before_stage = workspace.resize_seconds;
-        const auto pair_start = std::chrono::steady_clock::now();
-        if (options.pair_escape && (!options.incremental || fine_level<static_cast<std::size_t>(options.pair_escape_levels))) {
-            report.pair = run_pair_escape(
-                context, options, static_cast<int>(fine_level));
-        } else {
-            report.pair.cut_before = report.pair.cut_after = report.plain.final_cut;
-        }
-        report.timings.pair_seconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - pair_start).count() -
-            (workspace.resize_seconds - resize_before_stage);
-        resize_before_stage = workspace.resize_seconds;
-        if (options.incremental && options.pair_escape && fine_level<static_cast<std::size_t>(options.pair_escape_levels)) {
-            report.cleanup=run_incremental_refinement(context,options,4,report.pair.cut_before);
-        } else if (options.incremental) {
-            report.cleanup.initial_cut = report.cleanup.final_cut = report.plain.final_cut;
-            report.cleanup.final_max_part_weight = report.plain.final_max_part_weight;
-        } else report.cleanup = run_plain_refinement(context, options, 1);
-        report.timings.cleanup_seconds = report.cleanup.seconds -
-            (workspace.resize_seconds - resize_before_stage);
-        report.timings.workspace_resize_seconds =
-            workspace.resize_seconds - workspace_start;
-        last_cut = report.cleanup.final_cut;
+        report.timings.workspace_resize_seconds = workspace.resize_seconds - workspace_start;
+        last_cut = report.refinement.final_cut;
         current_host_weights = context.host_part_weights;
         current_graph = std::move(context.graph);
         current_partition = std::move(context.partition);
@@ -1468,13 +664,6 @@ template void refine_partition<ActiveTypes>(
     std::vector<ActiveTypes::VertexT>&,
     const RefineOptions&,
     RefineStats*);
-
-template void coordinated_pair_escape<ActiveTypes>(
-    const WeightedGraph<ActiveTypes>&,
-    std::vector<ActiveTypes::VertexT>&,
-    const RefineOptions&,
-    int,
-    PairRefineStats*);
 
 template DeviceUncoarsenResult<ActiveTypes>
 refine_hierarchy_device<ActiveTypes>(

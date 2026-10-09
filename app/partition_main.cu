@@ -2,12 +2,14 @@
 #include "graph.hpp"
 #include "graph_types.hpp"
 #include "initial_partition.hpp"
+#include "partition_capacity.hpp"
 #include "uncoarsen.hpp"
 #include "check.hpp"
 #include "detail/scratch_pool.hpp"
 #include <thrust/copy.h>
 
 #include <cstdint>
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
@@ -18,34 +20,43 @@
 int main(int argc, char** argv) {
     try {
         const auto wall_start = std::chrono::steady_clock::now();
-        bool verify = false, gpu_initial = false;
+        bool verify = false;
         int positional_argc = argc;
         while (positional_argc > 1) {
             const std::string flag(argv[positional_argc - 1]);
             if (flag == "--verify") verify = true;
-            else if (flag == "--gpu-initial") gpu_initial = true;
             else break;
             --positional_argc;
         }
         if (positional_argc < 5 || positional_argc > 7) {
             std::cerr << "Usage: " << argv[0]
                       << " <indptr.bin> <indices.bin> <parts> <partition.out>"
-                      << " [imbalance_ratio] [seed] [--verify] [--gpu-initial]\n";
+                      << " [imbalance_ratio=1.03] [seed] [--verify]\n";
             return 2;
         }
         using Types = gpart::ActiveTypes;
         const int parts = std::stoi(argv[3]);
-        const double imbalance = positional_argc >= 6 ? std::stod(argv[5]) : 1.10;
+        const double imbalance = positional_argc >= 6 ? std::stod(argv[5]) : 1.03;
         const auto seed = positional_argc >= 7
             ? static_cast<std::uint32_t>(std::stoul(argv[6])) : 0U;
         const auto load_start = std::chrono::steady_clock::now();
         auto graph = gpart::load_weighted_graph<Types>(argv[1], argv[2]);
+        gpart::partition_capacity(static_cast<std::uint64_t>(graph.vertices()), parts, imbalance);
         const auto load_end = std::chrono::steady_clock::now();
         std::cout << "verify=" << (verify ? 1 : 0) << '\n';
         gpart::CoarsenOptions coarsen_options;
         coarsen_options.parts = parts;
         coarsen_options.seed = seed;
         coarsen_options.strict_verify = verify;
+        {
+            // A common coarse budget for small k; retain at least 64 coarse
+            // clusters per part so indivisible weights stay below the slack.
+            coarsen_options.cluster_size_factor=std::max(64,(512+parts-1)/parts);
+            coarsen_options.pack_isolated=true;
+        }
+        std::cout << "pipeline_mode=" << "incremental_bucket"
+                  << " cluster_size_factor=" << coarsen_options.cluster_size_factor
+                  << " pack_isolated=" << coarsen_options.pack_isolated << '\n';
         // Jet-aligned boundary: initialized execution space and uploaded input.
         // Retain the full wall clock separately; do not hide preparation costs.
         const auto prepare_start = std::chrono::steady_clock::now();
@@ -59,17 +70,16 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaDeviceSynchronize());
         const auto coarsen_end = std::chrono::steady_clock::now();
         const auto initial_start = std::chrono::steady_clock::now();
-        auto coarse_partition = gpu_initial
-            ? gpart::initial_partition_gpu<Types>(hierarchy.levels.back(), parts, imbalance, seed)
-            : gpart::initial_partition<Types>(hierarchy.levels.back(), parts, imbalance);
+        auto coarse_partition = gpart::initial_partition_gpu<Types>(
+            hierarchy.levels.back(), parts, imbalance, seed);
         CUDA_CHECK(cudaDeviceSynchronize());
         const auto initial_end = std::chrono::steady_clock::now();
         gpart::RefineOptions refine_options;
         refine_options.parts = parts;
         refine_options.imbalance_ratio = imbalance;
-        refine_options.seed = seed;
-        refine_options.max_rounds = 4;
+        refine_options.max_rounds = 32;
         refine_options.strict_verify = verify;
+        refine_options.refinement_growth_ratio=2.0;
         const auto uncoarsen_start = std::chrono::steady_clock::now();
         auto result = gpart::uncoarsen<Types>(
             hierarchy, std::move(coarse_partition), refine_options);

@@ -5,6 +5,7 @@
 #include "uncoarsen.hpp"
 #include "coarsen.hpp"
 #include "detail/scratch_pool.hpp"
+#include "partition_capacity.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -45,29 +46,33 @@ gpart::Hierarchy<Types> make_hierarchy() {
     return hierarchy;
 }
 
-template <typename Types>
-gpart::WeightedGraph<Types> make_pair_escape_graph() {
-    using OffsetT = typename Types::OffsetT;
-    using VertexT = typename Types::VertexT;
-    using WeightT = typename Types::WeightT;
-    gpart::WeightedGraph<Types> graph;
-    graph.offsets = {
-        OffsetT{0}, OffsetT{2}, OffsetT{4}, OffsetT{6},
-        OffsetT{8}, OffsetT{9}, OffsetT{10}};
-    graph.neighbors = {
-        VertexT{1}, VertexT{2}, VertexT{0}, VertexT{3},
-        VertexT{0}, VertexT{3}, VertexT{1}, VertexT{2},
-        VertexT{5}, VertexT{4}};
-    graph.edge_weights = {
-        WeightT{3}, WeightT{2}, WeightT{3}, WeightT{2},
-        WeightT{2}, WeightT{3}, WeightT{2}, WeightT{3},
-        WeightT{1}, WeightT{1}};
-    graph.vertex_weights.assign(6, WeightT{1});
-    return graph;
-}
-
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+template <typename Types>
+void check_isolated_packing() {
+    // Unequal weights include vertices crossing prefix-bin boundaries.
+    gpart::WeightedGraph<Types> host;
+    host.vertex_weights = {7,7,1,4,4,1,1,8,1,3,6,2};
+    host.offsets = {0,1,2,2,2,2,2,2,2,2,2,2,2};
+    host.neighbors = {1,0};
+    host.edge_weights = {3,3};
+    auto device = gpart::make_device_weighted(host);
+    gpart::SclpWorkspace<Types> workspace;
+    gpart::SclpStats before_stats, after_stats;
+    auto before = gpart::aggregate(device, workspace, 2, 0, 0, before_stats, false, 2, false);
+    auto after = gpart::aggregate(device, workspace, 2, 0, 0, after_stats, true, 2, true);
+    require(after.coarse_vertices < before.coarse_vertices,
+            "isolated packing failed to contract zero-degree vertices");
+    require(after.maximum_weight <= after.capacity,
+            "isolated packing exceeded cluster capacity");
+    std::vector<typename Types::VertexT> mapping(after.map.size());
+    thrust::copy(after.map.begin(), after.map.end(), mapping.begin());
+    require(mapping[0] != mapping[1], "heavy connected vertices exceeded merge capacity");
+    for (std::size_t v = 2; v < mapping.size(); ++v)
+        require(mapping[v] != mapping[0] && mapping[v] != mapping[1],
+                "isolated packing joined a connected cluster");
 }
 
 void check_scratch_pool_lifetime() {
@@ -279,6 +284,33 @@ void check_sort_weight_width() {
     }
 }
 
+template <typename Types>
+void check_refinement_gain_overflow() {
+    if constexpr (sizeof(typename Types::WeightT) == 8) {
+        gpart::WeightedGraph<Types> graph;
+        graph.offsets = {0, 1, 2};
+        graph.neighbors = {1, 0};
+        const auto weight = static_cast<typename Types::WeightT>(INT64_MAX / 2);
+        graph.edge_weights = {weight, weight};
+        graph.vertex_weights = {1, 1};
+        std::vector<typename Types::VertexT> labels{0, 1};
+        gpart::RefineOptions options;
+        options.parts = 2;
+        bool rejected = false;
+        try { gpart::refine_partition(graph, labels, options); }
+        catch (const std::overflow_error&) { rejected = true; }
+        require(rejected, "refinement accepted an unsafe signed gain range");
+
+        gpart::DeviceHierarchy<Types> hierarchy;
+        hierarchy.levels.push_back(gpart::make_device_weighted(graph));
+        thrust::device_vector<typename Types::VertexT> device_labels = labels;
+        rejected = false;
+        try { gpart::uncoarsen(hierarchy, std::move(device_labels), options); }
+        catch (const std::overflow_error&) { rejected = true; }
+        require(rejected, "coarsest refinement skipped signed gain validation");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -289,8 +321,10 @@ int main() {
         using Types = gpart::ActiveTypes;
         using VertexT = typename Types::VertexT;
         check_parallel_cut<Types>();
+        check_refinement_gain_overflow<Types>();
         check_cross_edge_contraction<Types>();
         check_sort_weight_width<Types>();
+        check_isolated_packing<Types>();
         auto hierarchy = make_hierarchy<Types>();
         // Both CSR validation paths must retain all rejection conditions.
         for (int failure = 0; failure < 4; ++failure) {
@@ -334,9 +368,14 @@ int main() {
         gpart::RefineOptions options;
         options.parts = 2;
         options.imbalance_ratio = 1.10;
-        options.seed = 0;
         options.max_rounds = 4;
         options.strict_verify = true;
+        // alpha*4/2=2.2 permits only load two, including on entry to refine.
+        std::vector<VertexT> overloaded{0, 0, 0, 1};
+        bool overloaded_rejected = false;
+        try { gpart::refine_partition(hierarchy.levels.front(), overloaded, options); }
+        catch (const std::invalid_argument&) { overloaded_rejected = true; }
+        require(overloaded_rejected, "ceil capacity admitted an imbalanced input");
         const auto final_partition = gpart::uncoarsen(
             hierarchy, coarse_partition, options);
         auto production_options = options;
@@ -409,57 +448,76 @@ int main() {
                 hierarchy.levels.front().vertex_weights[v];
         }
         require(
-            std::max(final_weight[0], final_weight[1]) <= 3,
+            std::max(final_weight[0], final_weight[1]) <= 2,
             "refinement violated balance");
 
-        auto pair_graph = make_pair_escape_graph<Types>();
-        std::vector<VertexT> pair_partition{0, 0, 1, 1, 0, 0};
-        const auto pair_cut_before = gpart::host_cut(
-            pair_graph, pair_partition);
-        require(pair_cut_before == 4, "pair test initial cut is wrong");
-        gpart::RefineStats plain_stats;
-        gpart::refine_partition(
-            pair_graph, pair_partition, options, &plain_stats);
-        require(
-            plain_stats.proposals == 0 &&
-            gpart::host_cut(pair_graph, pair_partition) == pair_cut_before,
-            "plain LP unexpectedly escaped the pair local optimum");
-
-        gpart::PairRefineStats pair_stats;
-        gpart::coordinated_pair_escape(
-            pair_graph, pair_partition, options, 0, &pair_stats);
-        require(pair_stats.candidates == 2, "pair candidate count is wrong");
-        require(pair_stats.mutual_pairs == 2, "mutual pair count is wrong");
-        require(pair_stats.accepted == 1, "pair admission count is wrong");
-        require(!pair_stats.rollback, "improving pair round rolled back");
-        require(
-            pair_stats.cut_before == 4 && pair_stats.cut_after == 0,
-            "pair cut statistics are wrong");
-        require(
-            pair_partition == std::vector<VertexT>({1, 1, 1, 1, 0, 0}),
-            "pair was not committed atomically or pairs overlapped");
-        const auto pair_cut_after = gpart::host_cut(
-            pair_graph, pair_partition);
-        require(
-            pair_cut_after < pair_cut_before && pair_cut_after == 0,
-            "pair escape did not strictly lower cut");
-        std::uint64_t pair_weights[2] = {0, 0};
-        for (std::size_t v = 0; v < pair_partition.size(); ++v) {
-            pair_weights[pair_partition[v]] += pair_graph.vertex_weights[v];
+        // Both parts are full. Two improving moves form a balanced cycle;
+        // vacancy-only admission rejects both; exploration can admit the cycle.
+        gpart::WeightedGraph<Types> exchange;
+        exchange.offsets = {0, 2, 5, 7, 10, 11, 12};
+        exchange.neighbors = {1, 3, 0, 2, 4, 1, 3, 0, 2, 5, 1, 3};
+        exchange.edge_weights = {1, 4, 1, 4, 100, 4, 1, 4, 1, 100, 100, 100};
+        exchange.vertex_weights.assign(6, 1);
+        std::vector<VertexT> exchange_labels{0, 0, 1, 1, 0, 1};
+        gpart::RefineOptions exchange_options;
+        exchange_options.parts = 2;
+        exchange_options.imbalance_ratio = 1.03;
+        gpart::RefineStats exchange_stats;
+        exchange_options.strict_verify=true;
+        exchange_options.max_rounds=32;
+        gpart::refine_partition(exchange,exchange_labels,exchange_options,&exchange_stats);
+        require(gpart::host_cut(exchange,exchange_labels)==2 &&
+                std::count(exchange_labels.begin(),exchange_labels.end(),0)==3,
+                "incremental exchange violated cut/balance");
+        // An improving move temporarily overloads part 1. Rebalancing must
+        // move an isolated vertex back, preserving the improvement exactly.
+        gpart::WeightedGraph<Types> repair;
+        repair.vertex_weights.assign(8,1);
+        repair.offsets={0,2,4,5,5,7,8,8,8};
+        repair.neighbors={1,4,0,2,1,0,5,4};
+        repair.edge_weights={1,4,1,100,100,4,100,100};
+        std::vector<VertexT> repair_labels{0,0,0,0,1,1,1,1};
+        gpart::refine_partition(repair,repair_labels,exchange_options,&exchange_stats);
+        require(gpart::host_cut(repair,repair_labels)==1 &&
+                std::count(repair_labels.begin(),repair_labels.end(),0)==4 &&
+                exchange_stats.admission_iterations>0,
+                "incremental rebalancing lost quality or violated capacity");
+        // Weighted vertices, unsorted duplicate adjacency and self loops.
+        // Strict mode compares every incremental update to an independent CSR
+        // rebuild; the CPU oracle also checks the restored best checkpoint.
+        for (int k : {2,4,8,32}) {
+            gpart::WeightedGraph<Types> stress;
+            std::vector<std::vector<std::pair<int,typename Types::WeightT>>> rows(384);
+            const auto add=[&](int a,int b,typename Types::WeightT w) {
+                rows[a].push_back({b,w});rows[b].push_back({a,w});
+            };
+            typename Types::WeightT scale=1;
+            if constexpr (sizeof(typename Types::WeightT)==8) scale=static_cast<typename Types::WeightT>(std::uint64_t{1}<<35);
+            std::vector<VertexT> labels(384);
+            std::uint64_t total=0;
+            for (int v=0;v<384;++v) {
+                add(v,(v+1)%384,scale*3);add(v,(v+17)%384,scale*11);
+                add(v,(v+17)%384,scale*7);add(v,v,scale*13);
+                stress.vertex_weights.push_back(1+(v/k)%3);
+                total+=stress.vertex_weights.back();labels[v]=v%k;
+            }
+            stress.offsets.push_back(0);
+            for (auto& row:rows) {
+                std::reverse(row.begin(),row.end());
+                for (auto [u,w]:row) { stress.neighbors.push_back(u);stress.edge_weights.push_back(w); }
+                stress.offsets.push_back(stress.neighbors.size());
+            }
+            const auto before=gpart::host_cut(stress,labels);
+            exchange_options.parts=k;
+            gpart::refine_partition(stress,labels,exchange_options,&exchange_stats);
+            require(gpart::host_cut(stress,labels)<=before,"weighted incremental refinement increased cut");
+            std::vector<std::uint64_t> loads(k,0);
+            for (int v=0;v<384;++v) loads[labels[v]]+=stress.vertex_weights[v];
+            require(*std::max_element(loads.begin(),loads.end())<=gpart::partition_capacity(total,k,1.03),
+                    "weighted bucket refinement exceeded capacity");
         }
-        require(
-            std::max(pair_weights[0], pair_weights[1]) <= 4,
-            "pair escape violated balance");
-        auto cleanup_options = options;
-        cleanup_options.max_rounds = 1;
-        gpart::refine_partition(
-            pair_graph, pair_partition, cleanup_options, nullptr);
-        require(
-            gpart::host_cut(pair_graph, pair_partition) == pair_cut_after,
-            "one-round cleanup increased the pair result cut");
         std::cout << "uncoarsen_small_ok=1 graph_type="
                   << gpart::kActiveGraphName << " final_cut=" << final_cut
-                  << " pair_escape_cut=" << pair_cut_after
                   << '\n';
         return 0;
     } catch (const std::exception& error) {

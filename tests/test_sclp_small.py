@@ -113,7 +113,7 @@ def check(path: Path, capacities: list[int]) -> None:
 
 def main() -> None:
     binary = Path(os.environ.get(
-        "MULTILEVEL_BIN", "build-gh200/gpart_coarsen_standard"))
+        "MULTILEVEL_BIN", "build-5090/gpart_coarsen_standard"))
     method = "sclp"
     with tempfile.TemporaryDirectory(prefix="sclp-small-") as tmp:
         root = Path(tmp)
@@ -124,11 +124,10 @@ def main() -> None:
             out = root / "sclp.hierarchy"
             log = root / "sclp.log"
             child_env = os.environ.copy()
-            child_env["GPU_LP_STRICT_VERIFY"] = "1"
             child_env["SCLP_DIAGNOSTICS"] = "1"
             subprocess.run(
                 [str(binary), str(root / "indptr.bin"), str(root / "indices.bin"),
-                 "4", str(out), "1.10", "0", "1.0", method, "2"],
+                 "4", str(out), "0", "1.0", "24", "--verify"],
                 check=True, stdout=log.open("w"), stderr=subprocess.STDOUT,
                 env=child_env,
             )

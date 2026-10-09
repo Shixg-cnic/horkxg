@@ -48,9 +48,7 @@ DeviceUncoarsenResult<Types> uncoarsen_impl(
     auto result = refine_hierarchy_device(
         hierarchy, std::forward<P>(coarsest_partition), options);
     for (const auto& level : result.levels) {
-        const auto& stats = level.plain;
-        const auto& pair_stats = level.pair;
-        const auto& cleanup_stats = level.cleanup;
+        const auto& stats = level.refinement;
         const auto& timings = level.timings;
         std::cout << std::setprecision(10)
                   << "uncoarsen_level=" << level.level
@@ -60,31 +58,21 @@ DeviceUncoarsenResult<Types> uncoarsen_impl(
                   << " projection_max_part_weight="
                   << level.projection_max_part_weight
                   << " projection_imbalance=" << level.projection_imbalance
-                  << " refine_rounds=" << (stats.rounds + cleanup_stats.rounds)
+                  << " refine_rounds=" << stats.rounds
                   << " refine_proposals="
-                  << (stats.proposals + cleanup_stats.proposals)
+                  << stats.proposals
                   << " refine_accepted="
-                  << (stats.accepted + cleanup_stats.accepted)
-                  << " admission_iterations=" << (stats.admission_iterations + cleanup_stats.admission_iterations)
-                  << " admission_fallbacks=" << (stats.admission_fallbacks + cleanup_stats.admission_fallbacks)
-                  << " refine_rollbacks=" << (stats.rollback_rounds + cleanup_stats.rollback_rounds)
-                  << " refined_cut=" << cleanup_stats.final_cut
+                  << stats.accepted
+                  << " admission_iterations=" << stats.admission_iterations
+                  << " admission_fallbacks=" << stats.admission_fallbacks
+                  << " refined_cut=" << stats.final_cut
                   << " refined_max_part_weight="
-                  << cleanup_stats.final_max_part_weight
-                  << " pair_candidates=" << pair_stats.candidates
-                  << " mutual_pairs=" << pair_stats.mutual_pairs
-                  << " pair_accepted=" << pair_stats.accepted
-                  << " pair_cut_before=" << pair_stats.cut_before
-                  << " pair_cut_after=" << pair_stats.cut_after
-                  << " pair_rollback=" << (pair_stats.rollback ? 1 : 0)
-                  << " cleanup_cut_after=" << cleanup_stats.final_cut
+                  << stats.final_max_part_weight
                   << " graph_h2d_seconds=" << timings.graph_h2d_seconds
                   << " workspace_resize_seconds=" << timings.workspace_resize_seconds
                   << " projection_gpu_seconds="
                   << timings.projection_gpu_seconds
-                  << " plain_seconds=" << timings.plain_seconds
-                  << " pair_seconds=" << timings.pair_seconds
-                  << " cleanup_seconds=" << timings.cleanup_seconds
+                  << " refinement_seconds=" << timings.refinement_seconds
                   << " verification_seconds="
                   << timings.verification_seconds << '\n';
     }

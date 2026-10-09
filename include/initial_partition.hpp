@@ -9,6 +9,6 @@ namespace gpart {
 template <typename Types>
 thrust::device_vector<typename Types::VertexT> initial_partition_gpu(
     const DeviceWeightedGraph<Types>& graph, int parts, double imbalance_ratio,
-    std::uint32_t seed = 0, int diffusion_steps = 64);
+    std::uint32_t seed = 0);
 
 }  // namespace gpart

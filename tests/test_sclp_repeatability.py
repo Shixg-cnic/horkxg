@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Repeat one SCLP run with the same seed and compare hierarchy bytes/logs.
 
-Persistent artifacts are written under the sibling single_gpu_lp_baseline
-results directory by default, never under this project checkout.
+Persistent artifacts are written under this project's ignored results directory.
 """
 
 from __future__ import annotations
@@ -16,9 +15,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_RESULTS = PROJECT_ROOT.parent / (
-    "single_gpu_lp_baseline/build-gh200/experiments/results/sclp_repeatability"
-)
+DEFAULT_RESULTS = PROJECT_ROOT / "results/sclp_repeatability"
 
 
 def sha256(path: Path) -> str:
@@ -39,7 +36,7 @@ def main() -> None:
     parser.add_argument("--max-levels", type=int, default=24)
     parser.add_argument(
         "--binary", default=str(
-            PROJECT_ROOT / "build-gh200/gpart_coarsen_standard")
+            PROJECT_ROOT / "build-5090/gpart_coarsen_standard")
     )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--output-dir", default=str(DEFAULT_RESULTS))
@@ -56,11 +53,8 @@ def main() -> None:
         args.indices,
         str(args.parts),
         "PLACEHOLDER",
-        "1.10",
         str(args.seed),
         str(args.stop_ratio),
-        "sclp",
-        "2",
         str(args.max_levels),
     ]
     for repeat in range(args.repeats):

@@ -11,18 +11,10 @@ namespace gpart {
 struct RefineOptions {
     int parts = 4;
     double imbalance_ratio = 1.03;
-    std::uint32_t seed = 0;
-    int max_rounds = 4;
+    int max_rounds = 32;
     bool strict_verify = false;
-    bool pair_escape = true;
-    bool incremental = false;
     int stale_rounds = 3;
-    bool bucket_rebalance = false;
-    double refinement_growth_ratio = 1.0;
-    int swap_rounds = 0;
-    bool randomized_ties = false;
-    int pair_escape_levels = 1;
-    bool pair_allow_overload = false;
+    double refinement_growth_ratio = 2.0;
 };
 
 struct RefineStats {
@@ -35,25 +27,13 @@ struct RefineStats {
     double seconds = 0.0;
     int admission_iterations = 0;
     int admission_fallbacks = 0;
-    int rollback_rounds = 0;
-};
-
-struct PairRefineStats {
-    std::uint64_t candidates = 0;
-    std::uint64_t mutual_pairs = 0;
-    std::uint64_t accepted = 0;
-    std::uint64_t cut_before = 0;
-    std::uint64_t cut_after = 0;
-    bool rollback = false;
 };
 
 struct RefineLevelTimings {
     double workspace_resize_seconds = 0.0;
     double graph_h2d_seconds = 0.0;
     double projection_gpu_seconds = 0.0;
-    double plain_seconds = 0.0;
-    double pair_seconds = 0.0;
-    double cleanup_seconds = 0.0;
+    double refinement_seconds = 0.0;
     double verification_seconds = 0.0;
 };
 
@@ -64,9 +44,7 @@ struct RefineLevelResult {
     std::uint64_t projection_cut = 0;
     std::uint64_t projection_max_part_weight = 0;
     double projection_imbalance = 0.0;
-    RefineStats plain;
-    PairRefineStats pair;
-    RefineStats cleanup;
+    RefineStats refinement;
     RefineLevelTimings timings;
 };
 
@@ -87,14 +65,6 @@ void refine_partition(
     std::vector<typename Types::VertexT>& partition,
     const RefineOptions& options,
     RefineStats* stats = nullptr);
-
-template <typename Types>
-void coordinated_pair_escape(
-    const WeightedGraph<Types>& graph,
-    std::vector<typename Types::VertexT>& partition,
-    const RefineOptions& options,
-    int level,
-    PairRefineStats* stats = nullptr);
 
 template <typename Types>
 DeviceUncoarsenResult<Types> refine_hierarchy_device(
