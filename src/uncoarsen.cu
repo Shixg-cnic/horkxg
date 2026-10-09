@@ -65,6 +65,9 @@ DeviceUncoarsenResult<Types> uncoarsen_impl(
                   << (stats.proposals + cleanup_stats.proposals)
                   << " refine_accepted="
                   << (stats.accepted + cleanup_stats.accepted)
+                  << " admission_iterations=" << (stats.admission_iterations + cleanup_stats.admission_iterations)
+                  << " admission_fallbacks=" << (stats.admission_fallbacks + cleanup_stats.admission_fallbacks)
+                  << " refine_rollbacks=" << (stats.rollback_rounds + cleanup_stats.rollback_rounds)
                   << " refined_cut=" << cleanup_stats.final_cut
                   << " refined_max_part_weight="
                   << cleanup_stats.final_max_part_weight

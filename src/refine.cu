@@ -3,6 +3,7 @@
 #include "check.hpp"
 #include "detail/scratch_pool.hpp"
 #include "graph_types.hpp"
+#include "partition_capacity.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -17,13 +18,16 @@
 #include <vector>
 
 #include <cub/device/device_radix_sort.cuh>
+#include <cub/block/block_scan.cuh>
 #include <cuda/std/tuple>
 #include <thrust/copy.h>
 #include <thrust/count.h>
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
 #include <thrust/fill.h>
+#include <thrust/equal.h>
 #include <thrust/functional.h>
+#include <thrust/iterator/counting_iterator.h>
 #include <thrust/reduce.h>
 #include <thrust/scan.h>
 #include <thrust/transform_reduce.h>
@@ -548,16 +552,7 @@ void device_part_weights(
 
 std::uint64_t refinement_capacity(
     std::uint64_t total_weight, int parts, double imbalance_ratio) {
-    const long double raw =
-        static_cast<long double>(total_weight) *
-        static_cast<long double>(imbalance_ratio) /
-        static_cast<long double>(parts);
-    if (!std::isfinite(raw) ||
-        raw > static_cast<long double>(
-                  std::numeric_limits<std::uint64_t>::max())) {
-        throw std::overflow_error("refinement capacity exceeds uint64");
-    }
-    return static_cast<std::uint64_t>(std::ceil(raw));
+    return partition_capacity(total_weight, parts, imbalance_ratio);
 }
 
 template <typename Types>
@@ -611,6 +606,17 @@ public:
     detail::ScratchVector<std::uint64_t> ordered_weights;
     detail::ScratchVector<std::uint64_t> prefix_weights;
     detail::ScratchVector<std::int32_t> accepted_flags;
+    detail::ScratchVector<std::uint64_t> dense_affinity;
+    detail::ScratchVector<std::int32_t> incremental_targets;
+    detail::ScratchVector<std::int64_t> incremental_gains;
+    detail::ScratchVector<std::int32_t> incremental_locks;
+    detail::ScratchVector<std::int32_t> incremental_flags;
+    detail::ScratchVector<VertexT> incremental_movers;
+    detail::ScratchVector<std::int64_t> incremental_delta;
+    detail::ScratchVector<std::int32_t> balance_bucket_ids;
+    detail::ScratchVector<std::uint64_t> balance_bucket_ranks;
+    detail::ScratchVector<unsigned long long> balance_bucket_counts;
+    detail::ScratchVector<unsigned long long> balance_bucket_offsets;
     detail::ScratchVector<std::uint8_t> radix_temp;
     double resize_seconds = 0.0;
 
@@ -687,7 +693,10 @@ public:
           warp_blocks(static_cast<int>(
               (n + kWarpsPerBlock - 1) / kWarpsPerBlock)) {
         if (options.parts < 2 || options.parts > 32 ||
-            options.max_rounds < 0 || options.max_rounds > 4 ||
+            options.max_rounds < 0 || options.max_rounds > 64 ||
+            options.stale_rounds < 1 || options.stale_rounds > 64 ||
+            !std::isfinite(options.refinement_growth_ratio) || options.refinement_growth_ratio < 1.0 ||
+            options.swap_rounds < 0 || options.swap_rounds > 64 ||
             !std::isfinite(options.imbalance_ratio) ||
             options.imbalance_ratio < 1.0 || n <= 0) {
             throw std::invalid_argument("invalid refinement options");
@@ -772,10 +781,15 @@ public:
 };
 
 template <typename Types>
+RefineStats run_incremental_refinement(RefineDeviceContext<Types>&,
+    const RefineOptions&, int,std::uint64_t checkpoint_cut=UINT64_MAX);
+
+template <typename Types>
 RefineStats run_plain_refinement(
     RefineDeviceContext<Types>& context,
     const RefineOptions& options,
     int rounds) {
+    if (options.incremental) return run_incremental_refinement(context, options, rounds);
     const auto start = std::chrono::steady_clock::now();
     auto& device_graph = context.graph;
     auto& device_partition = context.partition;
@@ -856,16 +870,14 @@ RefineStats run_plain_refinement(
             thrust::raw_pointer_cast(ordered_targets.data()),
             thrust::raw_pointer_cast(ordered_weights.data()));
         CUDA_CHECK(cudaGetLastError());
-        thrust::inclusive_scan_by_key(
-            thrust::device,
-            ordered_targets.begin(), ordered_targets.begin() + proposal_count,
+        thrust::inclusive_scan_by_key(thrust::device,
+            ordered_targets.begin(), ordered_targets.begin()+proposal_count,
             ordered_weights.begin(), prefix_weights.begin());
-        refine_admission_kernel<<<proposal_blocks, 256>>>(
-            proposal_count,
+        refine_admission_kernel<<<proposal_blocks, 256>>>(proposal_count,
             thrust::raw_pointer_cast(ordered_targets.data()),
             thrust::raw_pointer_cast(prefix_weights.data()),
             thrust::raw_pointer_cast(part_weights.data()),
-            capacity,
+            options.incremental && options.pair_allow_overload ? UINT64_MAX:capacity,
             thrust::raw_pointer_cast(accepted_flags.data()));
         CUDA_CHECK(cudaGetLastError());
         const auto accepted_count = static_cast<std::uint64_t>(thrust::count(
@@ -889,6 +901,7 @@ RefineStats run_plain_refinement(
         }
         const auto next_cut = device_cut();
         if (next_cut > current_cut) {
+            ++stats.rollback_rounds;
             thrust::copy(
                 previous_partition.begin(), previous_partition.begin() + n,
                 device_partition.begin());
@@ -977,6 +990,8 @@ struct ToCheckedWeight {
     template <typename W>
     __host__ __device__ CheckedWeight operator()(W weight) const { return CheckedWeight(weight); }
 };
+
+#include "refine_incremental.cuh"
 
 template <typename Types>
 PairRefineStats run_pair_escape(
@@ -1132,7 +1147,7 @@ PairRefineStats run_pair_escape(
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
             context.sync_part_weights();
-            if (*std::max_element(
+            if (!(options.incremental && options.pair_allow_overload) && *std::max_element(
                     host_part_weights.begin(), host_part_weights.end()) >
                 capacity) {
                 throw std::runtime_error(
@@ -1148,6 +1163,8 @@ PairRefineStats run_pair_escape(
                     previous_part_weights.begin(),
                     previous_part_weights.begin() + part_weights.size(),
                     part_weights.begin());
+                context.sync_part_weights();
+                stats.cut_after=stats.cut_before;
             }
         }
     }
@@ -1189,7 +1206,10 @@ DeviceUncoarsenResult<Types> refine_hierarchy_impl(
     const RefineOptions& options) {
     using VertexT = typename Types::VertexT;
     if (options.parts < 2 || options.parts > 32 || options.max_rounds < 0 ||
-        options.max_rounds > 4 || !std::isfinite(options.imbalance_ratio) ||
+        options.max_rounds > 64 || options.stale_rounds < 1 || options.stale_rounds > 64 ||
+        !std::isfinite(options.refinement_growth_ratio) || options.refinement_growth_ratio < 1.0 ||
+        options.swap_rounds < 0 || options.swap_rounds > 64 ||
+        !std::isfinite(options.imbalance_ratio) ||
         options.imbalance_ratio < 1.0) {
         throw std::invalid_argument("invalid refinement options");
     }
@@ -1244,8 +1264,26 @@ DeviceUncoarsenResult<Types> refine_hierarchy_impl(
 
     DeviceUncoarsenResult<Types> result;
     result.levels.reserve(hierarchy.levels.size() - 1);
-    std::uint64_t last_cut = hierarchy.levels.size() == 1
-        ? device_cut_value(current_graph, current_partition, cut_counter) : 0;
+    std::uint64_t last_cut=0;
+    auto last_refined_vertices=current_graph.vertices();
+    if (options.incremental) {
+        RefineDeviceContext<Types> context(std::move(current_graph),
+            std::move(current_partition), std::move(current_part_weights),
+            current_host_weights, options, workspace);
+        const auto stats = run_incremental_refinement(context, options, options.max_rounds);
+        last_cut=stats.final_cut;
+        std::cout << "refine_coarsest vertices=" << context.n
+                  << " initial_cut=" << stats.initial_cut
+                  << " final_cut=" << stats.final_cut
+                  << " rounds=" << stats.rounds
+                  << " seconds=" << stats.seconds << '\n';
+        current_graph = std::move(context.graph);
+        current_partition = std::move(context.partition);
+        current_part_weights = std::move(context.part_weights);
+        current_host_weights = context.host_part_weights;
+    }
+    if (!options.incremental && hierarchy.levels.size() == 1)
+        last_cut=device_cut_value(current_graph, current_partition, cut_counter);
 
     for (std::size_t coarse_level = hierarchy.levels.size() - 1;
          coarse_level > 0; --coarse_level) {
@@ -1344,8 +1382,17 @@ DeviceUncoarsenResult<Types> refine_hierarchy_impl(
             std::move(fine_graph), std::move(fine_partition),
             std::move(fine_part_weights), projected_weights, options, workspace);
         auto resize_before_stage = workspace.resize_seconds;
-        report.plain = run_plain_refinement(
-            context, options, options.max_rounds);
+        const bool refine_this_level = !options.incremental || fine_level==0 ||
+            report.vertices>=options.refinement_growth_ratio*last_refined_vertices;
+        if (refine_this_level) {
+            report.plain = run_plain_refinement(context, options, options.max_rounds);
+            last_refined_vertices=report.vertices;
+        } else {
+            // Projection preserves cut and part weights. Avoid rebuilding
+            // the affinity cache when this level adds little resolution.
+            report.plain.initial_cut=report.plain.final_cut=last_cut;
+            report.plain.final_max_part_weight=report.projection_max_part_weight;
+        }
         if (!options.strict_verify) {
             report.projection_cut = report.plain.initial_cut;
         }
@@ -1353,13 +1400,22 @@ DeviceUncoarsenResult<Types> refine_hierarchy_impl(
             (workspace.resize_seconds - resize_before_stage);
         resize_before_stage = workspace.resize_seconds;
         const auto pair_start = std::chrono::steady_clock::now();
-        report.pair = run_pair_escape(
-            context, options, static_cast<int>(fine_level));
+        if (options.pair_escape && (!options.incremental || fine_level<static_cast<std::size_t>(options.pair_escape_levels))) {
+            report.pair = run_pair_escape(
+                context, options, static_cast<int>(fine_level));
+        } else {
+            report.pair.cut_before = report.pair.cut_after = report.plain.final_cut;
+        }
         report.timings.pair_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - pair_start).count() -
             (workspace.resize_seconds - resize_before_stage);
         resize_before_stage = workspace.resize_seconds;
-        report.cleanup = run_plain_refinement(context, options, 1);
+        if (options.incremental && options.pair_escape && fine_level<static_cast<std::size_t>(options.pair_escape_levels)) {
+            report.cleanup=run_incremental_refinement(context,options,4,report.pair.cut_before);
+        } else if (options.incremental) {
+            report.cleanup.initial_cut = report.cleanup.final_cut = report.plain.final_cut;
+            report.cleanup.final_max_part_weight = report.plain.final_max_part_weight;
+        } else report.cleanup = run_plain_refinement(context, options, 1);
         report.timings.cleanup_seconds = report.cleanup.seconds -
             (workspace.resize_seconds - resize_before_stage);
         report.timings.workspace_resize_seconds =

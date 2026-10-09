@@ -10,10 +10,19 @@ namespace gpart {
 
 struct RefineOptions {
     int parts = 4;
-    double imbalance_ratio = 1.10;
+    double imbalance_ratio = 1.03;
     std::uint32_t seed = 0;
     int max_rounds = 4;
     bool strict_verify = false;
+    bool pair_escape = true;
+    bool incremental = false;
+    int stale_rounds = 3;
+    bool bucket_rebalance = false;
+    double refinement_growth_ratio = 1.0;
+    int swap_rounds = 0;
+    bool randomized_ties = false;
+    int pair_escape_levels = 1;
+    bool pair_allow_overload = false;
 };
 
 struct RefineStats {
@@ -24,6 +33,9 @@ struct RefineStats {
     std::uint64_t final_cut = 0;
     std::uint64_t final_max_part_weight = 0;
     double seconds = 0.0;
+    int admission_iterations = 0;
+    int admission_fallbacks = 0;
+    int rollback_rounds = 0;
 };
 
 struct PairRefineStats {
